@@ -17,39 +17,132 @@ WEATHER_CODES = {
     96: "Thunderstorm with hail", 97: "Heavy thunderstorm", 99: "Severe thunderstorm",
 }
 
+# Common country names and abbreviations accepted in a "city, country" query.
+COUNTRY_CODES = {
+    "india": "IN", "uk": "GB", "united kingdom": "GB", "great britain": "GB",
+    "usa": "US", "us": "US", "united states": "US", "united states of america": "US",
+    "japan": "JP", "pakistan": "PK", "canada": "CA", "australia": "AU",
+}
+
+# Keys are case-insensitive user spellings; each entry carries the preferred
+# canonical result and alternative names to query. Extend this table to add
+# more common city aliases without changing the search flow.
+CITY_ALIASES = {
+    "bangalore": {"canonical": "Bengaluru", "country_code": "IN", "alternates": ("Bengaluru",)},
+    "bengaluru": {"canonical": "Bengaluru", "country_code": "IN", "alternates": ("Bangalore",)},
+}
+
+
+def _split_query(query):
+    """Return the API name and optional ISO country code from a city, country query."""
+    parts = [part.strip() for part in str(query).split(",") if part.strip()]
+    if len(parts) > 1 and parts[-1].casefold() in COUNTRY_CODES:
+        return ", ".join(parts[:-1]), COUNTRY_CODES[parts[-1].casefold()]
+    return str(query).strip(), None
+
+
+def _rank_location(place, query, canonical_name=None, preferred_country=None):
+    """Rank preferred alias targets, then exact/relevant populated places."""
+    wanted = query.casefold().strip()
+    name = str(place.get("name", "")).casefold().strip()
+    canonical = str(canonical_name or query).casefold().strip()
+    country_code = str(place.get("country_code", "")).upper()
+    feature = str(place.get("feature_code", "")).upper()
+    # Open-Meteo/GeoNames PPLC is a national capital; PPLA* are regional seats.
+    type_rank = 3 if feature == "PPLC" else 2 if feature.startswith("PPLA") else 1 if feature.startswith("PPL") else 0
+    try:
+        population = max(0, int(place.get("population") or 0))
+    except (TypeError, ValueError):
+        population = 0
+    preferred = bool(preferred_country and country_code == preferred_country.upper() and name == canonical)
+    return (preferred, name == canonical, name == wanted, type_rank, population)
+
+
+def _location_identity(location):
+    """Use coordinates to coalesce alias hits even when their IDs differ."""
+    return ("coordinates", round(location["latitude"], 5), round(location["longitude"], 5))
+
 
 def search_locations(query, timeout=8):
-    """Return genuine geocoding matches; errors are raised for UI handling."""
+    """Search original and configured aliases, merge real results, and rank matches.
+
+    A country qualifier is passed to every query and also enforced locally so
+    unrelated same-name places can never leak into a country-specific search.
+    """
     query = str(query).strip()
-    if len(query) < 2:
+    name_query, country_code = _split_query(query)
+    if len(name_query) < 2:
         raise ValueError("Enter at least two characters to search for a location.")
-    try:
-        response = requests.get(GEOCODE_URL, params={
-            "name": query, "count": 8, "language": "en", "format": "json",
-        }, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Open-Meteo geocoding request failed: {exc}") from exc
-    except ValueError as exc:
-        raise RuntimeError("Open-Meteo geocoding returned invalid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Open-Meteo geocoding returned an invalid response shape.")
-    results = payload.get("results", [])
-    if not isinstance(results, list):
-        raise RuntimeError("Open-Meteo geocoding returned an invalid results list.")
-    if not results:
-        raise ValueError(f"No location found for “{query}”.")
-    locations = [{
-        "name": place.get("name", "Unknown"),
-        "admin1": place.get("admin1", ""),
-        "country": place.get("country", ""),
-        "latitude": float(place["latitude"]),
-        "longitude": float(place["longitude"]),
-        "timezone": place.get("timezone", "auto"),
-    } for place in results if "latitude" in place and "longitude" in place]
-    if not locations:
+    alias = CITY_ALIASES.get(name_query.casefold())
+    search_terms = list(dict.fromkeys((name_query, *(alias["alternates"] if alias else ()))))
+    canonical_name = alias["canonical"] if alias else name_query
+    preferred_country = alias.get("country_code") if alias else None
+
+    raw_locations, failures = [], []
+    successful_responses = 0
+    had_results = False
+    for term in search_terms:
+        params = {"name": term, "count": 100, "language": "en", "format": "json"}
+        if country_code:
+            params["countryCode"] = country_code
+        try:
+            response = requests.get(GEOCODE_URL, params=params, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            failures.append(str(exc))
+            continue
+        except ValueError as exc:
+            failures.append(f"invalid JSON: {exc}")
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("results", []), list):
+            failures.append("invalid response shape")
+            continue
+        successful_responses += 1
+        results = payload.get("results", [])
+        had_results = had_results or bool(results)
+        raw_locations.extend(results)
+
+    if not successful_responses and failures:
+        raise RuntimeError("Open-Meteo geocoding request failed: " + "; ".join(failures))
+
+    locations_by_key = {}
+    for place in raw_locations:
+        if not isinstance(place, dict) or "latitude" not in place or "longitude" not in place:
+            continue
+        try:
+            latitude, longitude = float(place["latitude"]), float(place["longitude"])
+        except (TypeError, ValueError):
+            continue
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            continue
+        result_country = str(place.get("country_code", "")).upper()
+        if country_code and result_country != country_code:
+            continue
+        location = {
+            "name": place.get("name", "Unknown"), "admin1": place.get("admin1", ""),
+            "country": place.get("country", ""), "latitude": latitude, "longitude": longitude,
+            "timezone": place.get("timezone", "auto"), "country_code": result_country,
+            "population": place.get("population", 0), "feature_code": place.get("feature_code", ""),
+        }
+        if place.get("id") is not None:
+            location["id"] = place["id"]
+        rank = _rank_location(location, name_query, canonical_name, preferred_country)
+        key = _location_identity(location)
+        previous = locations_by_key.get(key)
+        # Keep the canonical alias record when two queries resolve to one point.
+        if previous is None or rank > previous[0]:
+            locations_by_key[key] = (rank, location)
+
+    locations = [item[1] for item in locations_by_key.values()]
+    if not locations and failures and successful_responses == 0:
+        raise RuntimeError("Open-Meteo geocoding request failed: " + "; ".join(failures))
+    if not locations and had_results:
         raise RuntimeError("Open-Meteo returned location matches without usable coordinates.")
+    if not locations:
+        raise ValueError(f'No location found for "{query}".')
+    # Stable sort preserves API order among equally relevant/populated places.
+    locations.sort(key=lambda loc: _rank_location(loc, name_query, canonical_name, preferred_country), reverse=True)
     return locations
 
 

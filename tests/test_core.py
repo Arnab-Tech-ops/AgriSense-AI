@@ -143,6 +143,134 @@ class GeoProviderTests(unittest.TestCase):
 
 
 class WeatherTests(unittest.TestCase):
+    @staticmethod
+    def _place(name, country, code, lat, lon, population=0, feature="PPL"):
+        return {"name": name, "country": country, "country_code": code,
+                "latitude": lat, "longitude": lon, "population": population,
+                "feature_code": feature, "admin1": "Region"}
+
+    def test_bangalore_alias_fallback_reproduces_distinct_api_responses(self):
+        # Reproduce the observed API behavior: the first real query only
+        # matches Bangalore Town in Pakistan; the alias query finds Bengaluru.
+        bangalore_response, bengaluru_response = Mock(), Mock()
+        for response in (bangalore_response, bengaluru_response):
+            response.raise_for_status.return_value = None
+        bangalore_response.json.return_value = {"results": [
+            self._place("Bangalore Town", "Pakistan", "PK", 25.1, 68.8, 12000),
+        ]}
+        bengaluru_response.json.return_value = {"results": [
+            self._place("Bengaluru", "India", "IN", 12.97, 77.59, 8400000, "PPLA"),
+        ]}
+        with patch("weather.requests.get", side_effect=[bangalore_response, bengaluru_response]) as get:
+            results = search_locations("Bangalore")
+        self.assertEqual(results[0]["country"], "India")
+        self.assertEqual(results[0]["name"], "Bengaluru")
+        self.assertEqual([item["country"] for item in results], ["India", "Pakistan"])
+        self.assertEqual([call.kwargs["params"]["name"] for call in get.call_args_list], ["Bangalore", "Bengaluru"])
+        for call in get.call_args_list:
+            self.assertEqual(call.kwargs["params"]["count"], 100)
+            self.assertNotIn("countryCode", call.kwargs["params"])
+
+    def test_bengaluru_query_returns_indian_city(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [
+            self._place("Bengaluru", "India", "IN", 12.97, 77.59, 8400000, "PPLA"),
+        ]}
+        with patch("weather.requests.get", side_effect=[response, response]) as get:
+            results = search_locations("Bengaluru")
+        self.assertEqual(results[0]["name"], "Bengaluru")
+        self.assertEqual(results[0]["country_code"], "IN")
+        self.assertEqual([call.kwargs["params"]["name"] for call in get.call_args_list], ["Bengaluru", "Bangalore"])
+
+    def test_explicit_country_uses_api_filter_and_rejects_wrong_country_results(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        bangalore_response, bengaluru_response = Mock(), Mock()
+        for item in (bangalore_response, bengaluru_response):
+            item.raise_for_status.return_value = None
+        bangalore_response.json.return_value = {"results": [self._place("Bangalore Town", "Pakistan", "PK", 25.1, 68.8)]}
+        bengaluru_response.json.return_value = {"results": [self._place("Bengaluru", "India", "IN", 12.97, 77.59, 8400000, "PPLA")]}
+        with patch("weather.requests.get", side_effect=[bangalore_response, bengaluru_response]) as get:
+            results = search_locations("Bangalore, India")
+        self.assertEqual([item["country"] for item in results], ["India"])
+        self.assertEqual([call.kwargs["params"]["name"] for call in get.call_args_list], ["Bangalore", "Bengaluru"])
+        self.assertTrue(all(call.kwargs["params"]["countryCode"] == "IN" for call in get.call_args_list))
+
+    def test_explicit_common_country_aliases_are_filtered(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": []}
+        for query, expected_name, expected_code in (("London, UK", "London", "GB"),
+                                                     ("Tokyo, Japan", "Tokyo", "JP")):
+            with self.subTest(query=query), patch("weather.requests.get", return_value=response) as get:
+                with self.assertRaisesRegex(ValueError, "No location found"):
+                    search_locations(query)
+                self.assertEqual(get.call_args.kwargs["params"]["name"], expected_name)
+                self.assertEqual(get.call_args.kwargs["params"]["countryCode"], expected_code)
+
+    def test_global_search_queries_remain_unfiltered(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        for query, place in (
+            ("London", self._place("London", "United Kingdom", "GB", 51.5, -.1, 9000000, "PPLC")),
+            ("Tokyo", self._place("Tokyo", "Japan", "JP", 35.68, 139.69, 14000000, "PPLC")),
+        ):
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"results": [place]}
+            with self.subTest(query=query), patch("weather.requests.get", return_value=response) as get:
+                results = search_locations(query)
+                self.assertEqual(results[0]["name"], query)
+                self.assertEqual(results[0]["country_code"], place["country_code"])
+                self.assertNotIn("countryCode", get.call_args.kwargs["params"])
+
+    def test_alias_duplicates_by_coordinates_are_removed(self):
+        original, alias = Mock(), Mock()
+        for response in (original, alias):
+            response.raise_for_status.return_value = None
+        original.json.return_value = {"results": [
+            {**self._place("Bangalore", "India", "IN", 12.9716, 77.5946, 8400000, "PPLA"), "id": 1},
+        ]}
+        alias.json.return_value = {"results": [
+            {**self._place("Bengaluru", "India", "IN", 12.9716, 77.5946, 8400000, "PPLA"), "id": 2},
+        ]}
+        with patch("weather.requests.get", side_effect=[original, alias]):
+            results = search_locations("Bangalore")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "Bengaluru")
+
+    def test_all_alias_queries_empty_returns_no_match(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": []}
+        with patch("weather.requests.get", side_effect=[response, response]):
+            with self.assertRaisesRegex(ValueError, "No location found"):
+                search_locations("Bangalore")
+
+    def test_alias_success_survives_failure_of_original_query(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [
+            self._place("Bengaluru", "India", "IN", 12.97, 77.59, 8400000, "PPLA"),
+        ]}
+        with patch("weather.requests.get", side_effect=[requests.Timeout("first query timed out"), response]):
+            results = search_locations("Bangalore")
+        self.assertEqual(results[0]["name"], "Bengaluru")
+        self.assertEqual(results[0]["country_code"], "IN")
+
+    def test_missing_results_and_unusable_candidates_are_clear(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": []}
+        with patch("weather.requests.get", side_effect=[response, response]):
+            with self.assertRaisesRegex(ValueError, "No location found"):
+                search_locations("Nonexistent City")
+        response.json.return_value = {"results": [{"latitude": "bad", "longitude": 0}]}
+        with patch("weather.requests.get", side_effect=[response, response]):
+            with self.assertRaisesRegex(RuntimeError, "without usable coordinates"):
+                search_locations("Example")
+
     def test_geocoding_failure_has_no_synthetic_fallback(self):
         with patch("weather.requests.get", side_effect=requests.Timeout("network timeout")):
             with self.assertRaises(RuntimeError):

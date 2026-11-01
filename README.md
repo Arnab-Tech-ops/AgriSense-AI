@@ -11,7 +11,7 @@ AgriSense AI is a Streamlit decision-support application that combines user-supp
 - Scaled, distance-weighted KNN and Random Forest trained on the same stratified training split and evaluated on the same held-out rows.
 - Model selected by stratified cross-validation on training data powers the default top-five crop recommendation; KNN and Random Forest can be compared explicitly.
 - Accuracy, macro precision, macro recall, macro F1, class reports, confusion matrices, and Random Forest feature importance.
-- Searchable place names, current weather and a real 7-day forecast from Open-Meteo, including precipitation, temperature range, wind, and ET₀ where returned.
+- Global city, town, and postal-code search with country qualifiers and configurable aliases; current conditions include feels-like temperature, wind direction, humidity, precipitation, cloud cover, and pressure, with a seven-day forecast including rain probability.
 - Optional SoilGrids WCS map-cell estimates for pH and organic carbon at 0–5 cm, with product resolution and 90% prediction intervals.
 - Plotly visualizations and in-session prediction history with a clear-history action.
 
@@ -75,7 +75,7 @@ ISRIC states that the SoilGrids REST API is temporarily paused and documents WCS
 
 ## Weather API
 
-The app resolves place search through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api) and queries current observations plus seven forecast days from the [Forecast API](https://open-meteo.com/en/docs). It reports the location, API valid time, retrieval timestamp, source, and local forecast timezone. Weather fetches are cached for one hour and can be manually refreshed. Current precipitation is the API's current interval; daily forecast precipitation is separately summed and never mislabeled as seasonal rainfall. ET₀ appears only if Open-Meteo provides it. There are no API keys in this project.
+The app resolves city, town, and postal-code searches through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api), supports country qualifiers and configurable common city aliases, then queries the selected coordinates through the [Forecast API](https://open-meteo.com/en/docs). Current data includes temperature, apparent (feels-like) temperature, condition/icon, humidity, wind speed/direction, current-interval precipitation, cloud cover, pressure, and local observation time. The seven-day forecast includes local day/date, condition, min/max temperature, maximum precipitation probability, rainfall, and maximum wind. Requests use the selected location timezone, finite timeouts, and the existing cache/manual-refresh controls. ET₀ appears only if Open-Meteo provides it. There are no API keys in this project.
 
 ## Known limitations and future improvements
 

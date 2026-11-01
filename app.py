@@ -409,12 +409,18 @@ with weather_tab:
                                     format_func=lambda i: ", ".join(x for x in (locations[i]["name"], locations[i]["admin1"], locations[i]["country"]) if x),
                                     key="weather_selected")
             loc = locations[selected]
+            st.caption(f"Selected location: {', '.join(x for x in (loc['name'], loc['admin1'], loc['country']) if x)} · {loc['latitude']:.4f}, {loc['longitude']:.4f}")
+            previous_location = st.session_state.get("weather_bundle_location")
+            selected_coordinates = (loc["latitude"], loc["longitude"])
+            if previous_location and previous_location != selected_coordinates:
+                st.session_state.weather_bundle = None
             if refresh_col.button("Fetch / refresh live weather", type="primary", width="stretch", key="refresh_weather"):
                 st.session_state.weather_refresh_key += 1
                 try:
                     st.session_state.weather_bundle = cached_weather(loc["latitude"], loc["longitude"],
                                                                       loc["timezone"], loc["name"], loc["admin1"],
                                                                       loc["country"], st.session_state.weather_refresh_key)
+                    st.session_state.weather_bundle_location = selected_coordinates
                     st.session_state.weather_error = None
                     st.success(f"Fresh weather received for {st.session_state.weather_bundle['place']}.")
                 except (RuntimeError, ValueError) as exc:
@@ -436,14 +442,17 @@ with weather_tab:
         if weather:
             cur = weather["current"]
             m1, m2, m3 = st.columns(3)
-            m1.metric("Temperature", _format_metric(cur["temperature_c"], "°C"), cur["condition"])
-            m2.metric("Relative humidity", _format_metric(cur["humidity_pct"], "%"))
-            m3.metric("Current-interval precipitation", _format_metric(cur["precipitation_mm"], "mm"), help="Current API interval; not a daily or seasonal total.")
-            m4, m5 = st.columns(2)
-            m4.metric("Wind speed", _format_metric(cur["wind_kmh"], "km/h"))
-            et0_today = weather["daily"][0]["et0_mm"]
-            m5.metric("Today reference ET₀", _format_metric(et0_today, "mm"))
-            st.write(f"**{weather['place']}** · {cur['condition']}")
+            m1.metric(f"{cur['icon']} Temperature", _format_metric(cur["temperature_c"], "°C"), cur["condition"])
+            m2.metric("Feels like", _format_metric(cur["apparent_temperature_c"], "°C"))
+            m3.metric("Humidity", _format_metric(cur["humidity_pct"], "%"))
+            m4, m5, m6 = st.columns(3)
+            m4.metric("Wind", _format_metric(cur["wind_kmh"], "km/h"), f"Direction {cur['wind_direction_deg']}°")
+            m5.metric("Current-interval precipitation", _format_metric(cur["precipitation_mm"], "mm"), help="Current API interval; not a daily or seasonal total.")
+            m6.metric("Cloud cover", _format_metric(cur["cloud_cover_pct"], "%"))
+            m7, m8 = st.columns(2)
+            m7.metric("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"))
+            m8.metric("Today reference ET₀", _format_metric(weather["daily"][0]["et0_mm"], "mm"))
+            st.write(f"**{weather['place']}** · {cur['icon']} {cur['condition']}")
             st.caption(f"Observation valid at location: {cur['time']} ({weather['timezone']}) · Data fetched {weather['fetched_at_utc']} UTC")
             st.caption(weather["source"])
         else:
@@ -461,9 +470,9 @@ with weather_tab:
         rain = px.bar(daily_frame, x="date", y="precipitation_mm", color="precipitation_mm", color_continuous_scale=["#DCEBDD", "#246447"], labels={"date":"Local date","precipitation_mm":"Forecast precipitation · mm"})
         rain.update_layout(template="plotly_white", paper_bgcolor="#fff", plot_bgcolor="#fff", font_color="#26352D", coloraxis_showscale=False, height=260)
         st.plotly_chart(rain, width="stretch")
-        display_daily = daily_frame[["date", "condition", "temperature_min", "temperature_max", "precipitation_mm", "wind_max_kmh", "et0_mm"]].rename(columns={
-            "date":"Local date", "condition":"Conditions", "temperature_min":"Min °C", "temperature_max":"Max °C",
-            "precipitation_mm":"Forecast rain/precip · mm", "wind_max_kmh":"Max wind · km/h", "et0_mm":"ET₀ · mm",
+        display_daily = daily_frame[["day", "date", "icon", "condition", "temperature_min", "temperature_max", "precipitation_probability_pct", "precipitation_mm", "wind_max_kmh", "et0_mm"]].rename(columns={
+            "day":"Day", "date":"Local date", "icon":"", "condition":"Conditions", "temperature_min":"Min °C", "temperature_max":"Max °C",
+            "precipitation_probability_pct":"Rain chance · %", "precipitation_mm":"Forecast rain/precip · mm", "wind_max_kmh":"Max wind · km/h", "et0_mm":"ET₀ · mm",
         })
         st.dataframe(display_daily, hide_index=True, width="stretch")
         rain_values = daily_frame["precipitation_mm"].dropna()

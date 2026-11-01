@@ -198,16 +198,32 @@ class WeatherTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["params"]["countryCode"] == "IN" for call in get.call_args_list))
 
     def test_explicit_common_country_aliases_are_filtered(self):
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"results": []}
-        for query, expected_name, expected_code in (("London, UK", "London", "GB"),
-                                                     ("Tokyo, Japan", "Tokyo", "JP")):
+        cases = (
+            ("London, UK", "London", "GB", self._place("London", "United Kingdom", "GB", 51.5, -.1)),
+            ("London, Canada", "London", "CA", self._place("London", "Canada", "CA", 42.98, -81.23)),
+            ("Tokyo, Japan", "Tokyo", "JP", self._place("Tokyo", "Japan", "JP", 35.68, 139.69)),
+        )
+        for query, expected_name, expected_code, place in cases:
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"results": [place]}
             with self.subTest(query=query), patch("weather.requests.get", return_value=response) as get:
-                with self.assertRaisesRegex(ValueError, "No location found"):
-                    search_locations(query)
+                results = search_locations(query)
+                self.assertEqual(results[0]["country_code"], expected_code)
                 self.assertEqual(get.call_args.kwargs["params"]["name"], expected_name)
                 self.assertEqual(get.call_args.kwargs["params"]["countryCode"], expected_code)
+
+    def test_postal_code_search_is_passed_to_global_geocoder(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [
+            self._place("New York", "United States", "US", 40.75, -73.99, 8000000, "PPLA"),
+        ]}
+        with patch("weather.requests.get", return_value=response) as get:
+            results = search_locations("10001")
+        self.assertEqual(results[0]["country_code"], "US")
+        self.assertEqual(get.call_args.kwargs["params"]["name"], "10001")
+        self.assertNotIn("countryCode", get.call_args.kwargs["params"])
 
     def test_global_search_queries_remain_unfiltered(self):
         response = Mock()
@@ -290,20 +306,60 @@ class WeatherTests(unittest.TestCase):
                 get_weather_bundle({"latitude":18.5,"longitude":73.8,"name":"Pune"})
 
     def test_weather_bundle_shapes_current_and_forecast_data(self):
-        current = {"time":"2026-11-01T10:00", "temperature_2m":25, "relative_humidity_2m":60,
-                   "precipitation":0.2, "wind_speed_10m":8, "weather_code":2}
+        current = {"time":"2026-11-01T10:00", "temperature_2m":25, "apparent_temperature":27,
+                   "relative_humidity_2m":60, "precipitation":0.2, "wind_speed_10m":8,
+                   "wind_direction_10m":180, "weather_code":2, "cloud_cover":45, "pressure_msl":1012.4}
         daily = {"time":["2026-11-01"], "temperature_2m_min":[18], "temperature_2m_max":[29],
-                 "precipitation_sum":[1.2], "weather_code":[2], "wind_speed_10m_max":[12],
+                 "precipitation_probability_max":[60], "precipitation_sum":[1.2], "weather_code":[2], "wind_speed_10m_max":[12],
                  "et0_fao_evapotranspiration":[4.1]}
         response = Mock()
         response.json.return_value = {"current":current, "daily":daily, "timezone":"Asia/Kolkata"}
         response.raise_for_status.return_value = None
-        with patch("weather.requests.get", return_value=response):
-            result = get_weather_bundle({"latitude":18.5,"longitude":73.8,"name":"Pune","country":"India"})
+        with patch("weather.requests.get", return_value=response) as get:
+            result = get_weather_bundle({"latitude":18.5,"longitude":73.8,"name":"Pune","country":"India","timezone":"Asia/Kolkata"})
         self.assertEqual(result["current"]["wind_kmh"], 8)
+        self.assertEqual(result["current"]["apparent_temperature_c"], 27)
+        self.assertEqual(result["current"]["wind_direction_deg"], 180)
+        self.assertEqual(result["current"]["cloud_cover_pct"], 45)
+        self.assertEqual(result["current"]["pressure_hpa"], 1012.4)
+        self.assertEqual(result["current"]["icon"], "⛅")
+        self.assertEqual(result["daily"][0]["day"], "Sunday")
+        self.assertEqual(result["daily"][0]["precipitation_probability_pct"], 60)
+        self.assertEqual(result["daily"][0]["icon"], "⛅")
         self.assertEqual(result["daily"][0]["et0_mm"], 4.1)
         self.assertEqual(result["place"], "Pune, India")
         self.assertTrue(result["fetched_at_utc"])
+        params = get.call_args.kwargs["params"]
+        self.assertEqual(params["timezone"], "Asia/Kolkata")
+        self.assertIn("apparent_temperature", params["current"])
+        self.assertIn("wind_direction_10m", params["current"])
+        self.assertIn("precipitation_probability_max", params["daily"])
+
+    def test_weather_parser_rejects_missing_current_or_daily_fields(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "current": {"time": "2026-11-01T10:00"},
+            "daily": {"time": ["2026-11-01"]},
+        }
+        with patch("weather.requests.get", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "incomplete current conditions"):
+                get_weather_bundle({"latitude": 12.9, "longitude": 77.5, "timezone": "Asia/Kolkata"})
+
+    def test_weather_parser_rejects_missing_daily_forecast_fields(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "current": {
+                "time": "2026-11-01T10:00", "temperature_2m": 25, "apparent_temperature": 27,
+                "relative_humidity_2m": 60, "precipitation": 0.2, "wind_speed_10m": 8,
+                "wind_direction_10m": 180, "weather_code": 2, "cloud_cover": 45, "pressure_msl": 1012.4,
+            },
+            "daily": {"time": ["2026-11-01"], "temperature_2m_min": [18]},
+        }
+        with patch("weather.requests.get", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "incomplete daily forecast"):
+                get_weather_bundle({"latitude": 12.9, "longitude": 77.5, "timezone": "Asia/Kolkata"})
 
 
 if __name__ == "__main__":

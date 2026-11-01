@@ -16,6 +16,13 @@ WEATHER_CODES = {
     85: "Snow showers", 86: "Heavy snow showers", 95: "Thunderstorm",
     96: "Thunderstorm with hail", 97: "Heavy thunderstorm", 99: "Severe thunderstorm",
 }
+WEATHER_ICONS = {
+    0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️", 45: "🌫️", 48: "🌫️",
+    51: "🌦️", 53: "🌦️", 55: "🌧️", 56: "🌧️", 57: "🌧️",
+    61: "🌧️", 63: "🌧️", 65: "🌧️", 66: "🌧️", 67: "🌧️",
+    71: "🌨️", 73: "🌨️", 75: "❄️", 77: "🌨️", 80: "🌦️", 81: "🌧️",
+    82: "🌧️", 85: "🌨️", 86: "❄️", 95: "⛈️", 96: "⛈️", 97: "⛈️", 99: "⛈️",
+}
 
 # Common country names and abbreviations accepted in a "city, country" query.
 COUNTRY_CODES = {
@@ -147,12 +154,12 @@ def search_locations(query, timeout=8):
 
 
 def get_weather_bundle(location, timeout=10):
-    """Retrieve observed current conditions and a 7-day real forecast."""
+    """Retrieve current conditions and a seven-day forecast in local time."""
     try:
         response = requests.get(FORECAST_URL, params={
             "latitude": location["latitude"], "longitude": location["longitude"],
-            "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,weather_code",
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max,et0_fao_evapotranspiration",
+            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,weather_code,cloud_cover,pressure_msl",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,et0_fao_evapotranspiration",
             "forecast_days": 7, "timezone": location.get("timezone") or "auto",
             "wind_speed_unit": "kmh", "temperature_unit": "celsius", "precipitation_unit": "mm",
         }, timeout=timeout)
@@ -166,8 +173,10 @@ def get_weather_bundle(location, timeout=10):
         raise RuntimeError("Open-Meteo forecast returned an invalid response shape.")
     current = payload.get("current")
     daily = payload.get("daily")
-    required_current = ("time", "temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m", "weather_code")
-    required_daily = ("time", "temperature_2m_min", "temperature_2m_max", "precipitation_sum", "weather_code")
+    required_current = ("time", "temperature_2m", "apparent_temperature", "relative_humidity_2m", "precipitation",
+                        "wind_speed_10m", "wind_direction_10m", "weather_code", "cloud_cover", "pressure_msl")
+    required_daily = ("time", "temperature_2m_min", "temperature_2m_max", "precipitation_probability_max",
+                      "precipitation_sum", "wind_speed_10m_max", "weather_code")
     if not isinstance(current, dict) or any(k not in current for k in required_current):
         raise RuntimeError("Open-Meteo returned incomplete current conditions.")
     if not isinstance(daily, dict) or any(k not in daily for k in required_daily):
@@ -184,8 +193,11 @@ def get_weather_bundle(location, timeout=10):
         code = daily["weather_code"][i]
         daily_rows.append({
             "date": daily["time"][i],
+            "day": datetime.fromisoformat(daily["time"][i]).strftime("%A"),
             "condition": WEATHER_CODES.get(code, f"Weather code {code}"),
+            "icon": WEATHER_ICONS.get(code, "🌡️"),
             "weather_code": code,
+            "precipitation_probability_pct": daily["precipitation_probability_max"][i],
             "temperature_min": daily["temperature_2m_min"][i],
             "temperature_max": daily["temperature_2m_max"][i],
             "precipitation_mm": daily["precipitation_sum"][i],
@@ -198,9 +210,14 @@ def get_weather_bundle(location, timeout=10):
         "timezone": payload.get("timezone", location.get("timezone", "")),
         "current": {
             "time": current["time"], "temperature_c": current["temperature_2m"],
+            "apparent_temperature_c": current["apparent_temperature"],
             "humidity_pct": current["relative_humidity_2m"],
             "precipitation_mm": current["precipitation"],
             "wind_kmh": current["wind_speed_10m"],
+            "wind_direction_deg": current["wind_direction_10m"],
+            "cloud_cover_pct": current["cloud_cover"],
+            "pressure_hpa": current["pressure_msl"],
+            "icon": WEATHER_ICONS.get(current["weather_code"], "🌡️"),
             "condition": WEATHER_CODES.get(current["weather_code"], f"Weather code {current['weather_code']}"),
         },
         "daily": daily_rows,

@@ -1,0 +1,3 @@
+# Optional dependencies for point sampling SoilGrids' modeled GeoTIFF WCS layers.
+-r requirements.txt
+rasterio>=1.3

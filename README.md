@@ -11,13 +11,14 @@ AgriSense AI is a Streamlit decision-support application that combines user-supp
 - Scaled, distance-weighted KNN and Random Forest trained on the same stratified training split and evaluated on the same held-out rows.
 - Model selected by stratified cross-validation on training data powers the default top-five crop recommendation; KNN and Random Forest can be compared explicitly.
 - Accuracy, macro precision, macro recall, macro F1, class reports, confusion matrices, and Random Forest feature importance.
-- Global city, town, and postal-code search with country qualifiers and configurable aliases; current conditions include feels-like temperature, wind direction, humidity, precipitation, cloud cover, and pressure, with a seven-day forecast including rain probability.
+- Global city, locality, and postal-code search with an ISO country/territory filter, country/state-qualified queries, exact postcode ranking, aliases, and selectable results. Results show postcode, administrative area, country code, coordinates, time zone, match type, and geocoding provider.
+- Optional GeoNames postal/place fallback when Open-Meteo has no exact match. It is enabled with a GeoNames username; provider coverage varies by country, and partial postcode records are labeled for review.
 - Optional SoilGrids WCS map-cell estimates for pH and organic carbon at 0–5 cm, with product resolution and 90% prediction intervals.
 - Plotly visualizations and in-session prediction history with a clear-history action.
 
 ## Run locally
 
-Python 3.10+ and Streamlit 1.51+ are required (the app uses current layout APIs and the soil form starts empty so it never pre-fills invented measurements).
+Python 3.10+ and Streamlit 1.51+ are required (the app uses current layout APIs and the soil form starts empty so it never pre-fills invented measurements). `pycountry` supplies the ISO 3166-1 alpha-2 country and territory list for the optional weather filter.
 
 ```bash
 python -m venv .venv
@@ -34,6 +35,16 @@ pip install -r requirements-geo.txt
 ```
 
 The app trains on first run if `models/crop_models.joblib` is missing, corrupt, outdated, or built against a different dataset hash. It saves a local bundle when the models directory is writable and continues in memory if saving fails. Existing old model files are not used as a substitute for the new evaluated bundle.
+
+### Optional GeoNames fallback
+
+Open-Meteo remains the primary geocoder and does not need credentials. To enable the optional GeoNames fallback, create a GeoNames account and set `GEONAMES_USERNAME` as an environment variable. For Streamlit Community Cloud, add this to the app's Secrets settings:
+
+```toml
+GEONAMES_USERNAME = "your-geonames-username"
+```
+
+Do not commit credentials or a local `.streamlit/secrets.toml` file. GeoNames documents a free-service limit of 10,000 credits per day and 1,000 per hour; the app only contacts it after Open-Meteo returns no usable match or no exact postcode match. GeoNames' own postal-data notes document country-specific limitations: Canada may return only the first three characters, Ireland and Malta only the first letters, Argentina uses an older four-digit dataset, and Brazil contains only major municipality codes ending in `-000`. Therefore, neither provider can guarantee every code worldwide. See the [GeoNames postal-code API policy and coverage notes](https://www.geonames.org/export/web-services.html) and [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api).
 
 Run the automated checks with:
 
@@ -75,7 +86,7 @@ ISRIC states that the SoilGrids REST API is temporarily paused and documents WCS
 
 ## Weather API
 
-The app resolves city, town, and postal-code searches through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api), supports country qualifiers and configurable common city aliases, then queries the selected coordinates through the [Forecast API](https://open-meteo.com/en/docs). Current data includes temperature, apparent (feels-like) temperature, condition/icon, humidity, wind speed/direction, current-interval precipitation, cloud cover, pressure, and local observation time. The seven-day forecast includes local day/date, condition, min/max temperature, maximum precipitation probability, rainfall, and maximum wind. Requests use the selected location timezone, finite timeouts, and the existing cache/manual-refresh controls. ET₀ appears only if Open-Meteo provides it. There are no API keys in this project.
+The app resolves place names and postal codes through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api), with ISO country-code filtering and a searchable country/territory selector. Country/state qualifiers and common aliases are supported. Exact postcode matches rank first; leading zeros and alphanumeric codes remain text, and duplicates are removed by coordinates. If Open-Meteo has no usable match and a GeoNames username is configured, its [postal-code service](https://www.geonames.org/export/web-services.html) is queried as a secondary source. Each result identifies the resolving provider and match type. The selected coordinates are passed to the [Open-Meteo Forecast API](https://open-meteo.com/en/docs), which returns temperature, apparent (feels-like) temperature, condition/icon, humidity, wind speed/direction, current-interval precipitation, cloud cover, pressure, and a local current time. Current conditions are model-based estimates, not physical weather-station observations; model metadata is shown only when returned. The seven-day forecast includes local day/date, condition, min/max temperature, maximum precipitation probability, rainfall, and maximum wind. Requests use the selected location timezone, finite timeouts, and manual refresh; each explicit weather refresh bypasses the prior cached response. ET₀ appears only if Open-Meteo provides it. Postal-code coverage remains provider- and country-dependent.
 
 ## Known limitations and future improvements
 

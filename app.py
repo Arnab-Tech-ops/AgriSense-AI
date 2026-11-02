@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import hashlib
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +13,8 @@ from ml_model import (DATA_PATH, FEATURES, classify_soil_quality,
                       predict_top_crops)
 from soil_geo import fetch_soilgrids_estimate
 from soil_data import read_lab_report, soil_data_sources, validate_inputs
-from weather import get_weather_bundle, search_locations
+from weather import (clear_weather_state, country_options, get_weather_bundle,
+                     next_weather_refresh, search_locations)
 
 st.set_page_config(page_title="AgriSense AI", page_icon="🌱", layout="wide")
 
@@ -67,8 +69,9 @@ def model_bundle():
 
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def cached_locations(query, refresh_key):
-    return search_locations(query)
+def cached_locations(query, country_code, geonames_username, refresh_key):
+    return search_locations(query, country_code=country_code,
+                            geonames_username=geonames_username)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -76,6 +79,21 @@ def cached_weather(latitude, longitude, timezone_name, name, admin1, country, re
     location = {"latitude": latitude, "longitude": longitude, "timezone": timezone_name,
                 "name": name, "admin1": admin1, "country": country}
     return get_weather_bundle(location)
+
+
+def geonames_username():
+    """Read optional GeoNames credentials from environment or Streamlit secrets."""
+    configured = os.getenv("GEONAMES_USERNAME", "").strip()
+    if configured:
+        return configured
+    try:
+        return str(st.secrets.get("GEONAMES_USERNAME", "")).strip()
+    except Exception:
+        return ""
+
+
+def clear_weather_search():
+    clear_weather_state(st.session_state)
 
 
 @st.cache_data(ttl=7 * 24 * 60 * 60, show_spinner=False)
@@ -107,7 +125,8 @@ if not selection_method:
 
 for key, default in (("analysis", None), ("history", []), ("weather_bundle", None),
                      ("weather_locations", []), ("weather_refresh_key", 0), ("location_refresh_key", 0),
-                     ("weather_error", None)):
+                     ("weather_error", None), ("weather_bundle_location", None),
+                     ("weather_country_filter", ""), ("weather_selected", 0)):
     st.session_state.setdefault(key, default)
 
 overview, soil_tab, weather_tab, model_tab, history_tab = st.tabs([
@@ -140,7 +159,7 @@ with overview:
             if bundle:
                 cur = bundle["current"]
                 st.metric(f"Current temperature · {bundle['place']}", _format_metric(cur["temperature_c"], "°C"), cur["condition"])
-                st.caption(f"Open-Meteo observation valid {cur['time']} · fetched {bundle['fetched_at_utc']} UTC")
+                st.caption(f"Open-Meteo model-based current conditions valid {cur['time']} · retrieved {bundle['fetched_at_utc']} UTC")
             else:
                 st.info("Search a location in Live weather to load current conditions and a 7-day forecast.")
     else:
@@ -388,34 +407,62 @@ with soil_tab:
 
 with weather_tab:
     st.subheader("Live weather and seven-day forecast")
-    st.caption("Current conditions are model-based observations; the daily panel is a forecast. Neither is silently substituted for seasonal model inputs.")
+    st.caption("Current conditions are Open-Meteo model-based estimates, not readings from a physical weather station. Forecast data is supplementary and is not substituted for seasonal crop-model inputs.")
     wc1, wc2 = st.columns([1.1, 1], gap="large")
     with wc1:
-        city = st.text_input("Search a town, city, or postal code", placeholder="e.g. Pune, India", key="weather_query")
-        search_col, refresh_col = st.columns(2)
+        city = st.text_input(
+            "Search cities, towns, localities, or postal codes worldwide",
+            placeholder="e.g. Pune, India",
+            help="Search local or international postal codes, ZIP codes, PIN codes, cities, towns, or localities.",
+            key="weather_query",
+        )
+        countries = dict(country_options())
+        country_filter = st.selectbox("Optional country / territory filter", [""] + list(countries),
+                                      format_func=lambda code: "Any country" if not code else f"{countries[code]} ({code})",
+                                      key="weather_country_filter",
+                                      help="The list uses ISO 3166-1 alpha-2 country and territory codes.")
+        search_col, clear_col = st.columns(2)
         if search_col.button("Search locations", width="stretch", key="search_weather"):
             st.session_state.weather_bundle = None
+            st.session_state.weather_bundle_location = None
             st.session_state.weather_error = None
             try:
-                st.session_state.weather_locations = cached_locations(city.strip(), st.session_state.location_refresh_key)
+                st.session_state.weather_locations = cached_locations(
+                    city.strip(), country_filter or None, geonames_username(),
+                    st.session_state.location_refresh_key)
                 st.session_state.weather_selected = 0
             except (ValueError, RuntimeError) as exc:
                 st.error(str(exc))
                 st.session_state.weather_locations = []
+                st.session_state.weather_error = str(exc)
+        clear_col.button("Clear search", width="stretch", key="clear_weather_search", on_click=clear_weather_search)
         locations = st.session_state.weather_locations
         if locations:
             options = list(range(len(locations)))
+
+            def format_location(index):
+                item = locations[index]
+                parts = [item["name"]]
+                if item.get("postal_code"):
+                    parts.append(item["postal_code"])
+                parts.extend(x for x in (item.get("admin1"), item.get("country")) if x)
+                return " · ".join(parts)
+
             selected = st.selectbox("Choose the matching location", options,
-                                    format_func=lambda i: ", ".join(x for x in (locations[i]["name"], locations[i]["admin1"], locations[i]["country"]) if x),
+                                    format_func=format_location,
                                     key="weather_selected")
             loc = locations[selected]
-            st.caption(f"Selected location: {', '.join(x for x in (loc['name'], loc['admin1'], loc['country']) if x)} · {loc['latitude']:.4f}, {loc['longitude']:.4f}")
+            st.caption(
+                f"Selected: {format_location(selected)} · country code {loc.get('country_code') or 'unavailable'} · "
+                f"{loc['latitude']:.5f}, {loc['longitude']:.5f} · time zone {loc.get('timezone') or 'auto'} · "
+                f"{loc.get('provider', 'Open-Meteo')} ({loc.get('match_type', 'location match')})"
+            )
             previous_location = st.session_state.get("weather_bundle_location")
             selected_coordinates = (loc["latitude"], loc["longitude"])
             if previous_location and previous_location != selected_coordinates:
                 st.session_state.weather_bundle = None
-            if refresh_col.button("Fetch / refresh live weather", type="primary", width="stretch", key="refresh_weather"):
-                st.session_state.weather_refresh_key += 1
+            if st.button("Fetch / refresh live weather", type="primary", width="stretch", key="refresh_weather"):
+                next_weather_refresh(st.session_state)
                 try:
                     st.session_state.weather_bundle = cached_weather(loc["latitude"], loc["longitude"],
                                                                       loc["timezone"], loc["name"], loc["admin1"],
@@ -427,10 +474,12 @@ with weather_tab:
                     st.session_state.weather_error = str(exc)
                     st.session_state.weather_bundle = None
                     st.error(str(exc))
-        elif refresh_col.button("Search again", width="stretch", key="refresh_location_search"):
+        elif city.strip() and st.button("Search locations again", width="stretch", key="refresh_location_search"):
             st.session_state.location_refresh_key += 1
             try:
-                st.session_state.weather_locations = cached_locations(city.strip(), st.session_state.location_refresh_key)
+                st.session_state.weather_locations = cached_locations(
+                    city.strip(), country_filter or None, geonames_username(),
+                    st.session_state.location_refresh_key)
             except (ValueError, RuntimeError) as exc:
                 st.session_state.weather_error = str(exc)
                 st.session_state.weather_locations = []
@@ -453,8 +502,11 @@ with weather_tab:
             m7.metric("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"))
             m8.metric("Today reference ET₀", _format_metric(weather["daily"][0]["et0_mm"], "mm"))
             st.write(f"**{weather['place']}** · {cur['icon']} {cur['condition']}")
-            st.caption(f"Observation valid at location: {cur['time']} ({weather['timezone']}) · Data fetched {weather['fetched_at_utc']} UTC")
+            st.caption(f"Current conditions valid at local time: {cur['time']} ({weather['timezone']}) · Retrieved {weather['fetched_at_utc']} UTC")
             st.caption(weather["source"])
+            if weather.get("weather_model"):
+                st.caption(f"Weather model metadata: {weather['weather_model']}")
+            st.caption(f"Geocoding provider: {weather.get('geocoding_provider', 'Open-Meteo')} · Weather provider: {weather.get('weather_provider', 'Open-Meteo Forecast API')}")
         else:
             st.info("Search and select a location to request live weather. Values appear only after a successful API response.")
 
@@ -524,5 +576,5 @@ with history_tab:
     st.markdown("**Soil measurement provenance**")
     st.write("Soil values shown above come from user entry or a user-uploaded lab CSV. No soil measurements are synthesized. When the optional geospatial extra is installed and ISRIC WCS responds, the Soil tab can retrieve separate, modelled SoilGrids pH and organic-carbon estimates with source, retrieval time, depth, resolution, and prediction interval.")
     st.markdown("**Weather provenance**")
-    st.write("Weather values are requested live from Open-Meteo. Search results use its Geocoding API; current observations and forecast values are labeled separately. API failures show errors and never create fallback weather values.")
+    st.write("Weather values are requested live from Open-Meteo. Current conditions are model-based estimates rather than physical-station observations; forecasts remain separate. Geocoding results identify their provider, and weather API failures show errors without fallback values.")
 

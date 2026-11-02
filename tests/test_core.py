@@ -11,7 +11,8 @@ import ml_model
 from ml_model import classify_soil_quality, load_dataset, predict_top_crops, train_models
 from soil_data import read_lab_report, validate_inputs
 from soil_data import soil_data_sources
-from weather import get_weather_bundle, search_locations
+from weather import (clear_weather_state, country_options, get_weather_bundle,
+                     next_weather_refresh, search_locations)
 from soil_geo import fetch_soilgrids_estimate
 
 
@@ -144,10 +145,10 @@ class GeoProviderTests(unittest.TestCase):
 
 class WeatherTests(unittest.TestCase):
     @staticmethod
-    def _place(name, country, code, lat, lon, population=0, feature="PPL"):
+    def _place(name, country, code, lat, lon, population=0, feature="PPL", postcodes=None):
         return {"name": name, "country": country, "country_code": code,
                 "latitude": lat, "longitude": lon, "population": population,
-                "feature_code": feature, "admin1": "Region"}
+                "feature_code": feature, "admin1": "Region", "postcodes": postcodes or []}
 
     def test_bangalore_alias_fallback_reproduces_distinct_api_responses(self):
         # Reproduce the observed API behavior: the first real query only
@@ -217,13 +218,146 @@ class WeatherTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {"results": [
-            self._place("New York", "United States", "US", 40.75, -73.99, 8000000, "PPLA"),
+            self._place("New York", "United States", "US", 40.75, -73.99, 8000000, "PPLA", ["10001"]),
         ]}
         with patch("weather.requests.get", return_value=response) as get:
             results = search_locations("10001")
         self.assertEqual(results[0]["country_code"], "US")
         self.assertEqual(get.call_args.kwargs["params"]["name"], "10001")
         self.assertNotIn("countryCode", get.call_args.kwargs["params"])
+        self.assertEqual(results[0]["postal_code"], "10001")
+        self.assertEqual(results[0]["match_type"], "exact postal-code match")
+
+    def test_all_requested_postal_formats_preserve_text_and_country(self):
+        cases = (
+            ("562157", "IN"), ("110001", "IN"), ("10001", "US"), ("00501", "US"),
+            ("SW1A 1AA", "GB"), ("K1A 0B1", "CA"), ("10115", "DE"), ("75001", "FR"),
+            ("100-0001", "JP"), ("2000", "AU"), ("1012 JS", "NL"), ("01001-000", "BR"),
+        )
+        for index, (postcode, code) in enumerate(cases):
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {"results": [self._place(
+                f"Locality {index}", code, code, 10 + index, 20 + index, postcodes=[postcode]) ]}
+            with self.subTest(postcode=postcode), patch("weather.requests.get", return_value=response) as get:
+                result = search_locations(postcode, country_code=code)
+                params = get.call_args.kwargs["params"]
+                self.assertEqual(params["name"], postcode)
+                self.assertEqual(params["countryCode"], code)
+                self.assertEqual(result[0]["postal_code"], postcode)
+                self.assertEqual(result[0]["match_type"], "exact postal-code match")
+
+    def test_exact_postcode_ranks_before_nearby_nonmatch(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [
+            self._place("Nearby", "United States", "US", 40.7, -74, 9000000, "PPLC", ["10002"]),
+            self._place("Exact", "United States", "US", 40.8, -73.9, 1000, "PPL", ["10001"]),
+        ]}
+        with patch("weather.requests.get", return_value=response):
+            result = search_locations("10001", country_code="US")
+        self.assertEqual([item["name"] for item in result], ["Exact"])
+
+    def test_country_options_use_iso_codes_and_include_territories(self):
+        choices = dict(country_options())
+        self.assertEqual(choices["IN"], "India")
+        self.assertIn("GB", choices)
+        self.assertIn("PR", choices)
+        self.assertTrue(all(len(code) == 2 for code in choices))
+
+    def test_region_and_country_qualification_normalizes_spacing_and_diacritics(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"results": [self._place("São Paulo", "Brazil", "BR", -23.5, -46.6)]}
+        with patch("weather.requests.get", return_value=response) as get:
+            result = search_locations("  Sao   Paulo, São Paulo, Brazil ")
+        self.assertEqual(result[0]["country_code"], "BR")
+        self.assertEqual(get.call_args.kwargs["params"]["name"], "Sao Paulo, São Paulo")
+        self.assertEqual(get.call_args.kwargs["params"]["countryCode"], "BR")
+
+    def test_geonames_fallback_resolves_postcode_with_country_filter(self):
+        openmeteo, geonames = Mock(), Mock()
+        for response in (openmeteo, geonames):
+            response.raise_for_status.return_value = None
+        openmeteo.json.return_value = {"results": []}
+        geonames.json.return_value = {"postalCodes": [{
+            "postalCode": "00501", "placeName": "Holtsville", "adminName1": "New York",
+            "countryName": "United States", "countryCode": "US", "lat": "40.8154",
+            "lng": "-73.0451", "geonameId": 123,
+        }]}
+        with patch("weather.requests.get", side_effect=[openmeteo, geonames]) as get:
+            result = search_locations("00501", country_code="US", geonames_username="test-user")
+        self.assertEqual(result[0]["provider"], "GeoNames")
+        self.assertEqual(result[0]["postal_code"], "00501")
+        self.assertEqual(get.call_args_list[1].args[0], "https://secure.geonames.org/postalCodeSearchJSON")
+        params = get.call_args_list[1].kwargs["params"]
+        self.assertEqual(params["postalcode"], "00501")
+        self.assertNotIn("placename", params)
+        self.assertEqual(params["country"], "US")
+        self.assertEqual(params["username"], "test-user")
+        self.assertEqual(get.call_args_list[1].kwargs["timeout"], 8)
+
+    def test_geonames_ssl_http_and_timeout_failures_are_reported_without_credentials(self):
+        import requests
+
+        primary = Mock()
+        primary.raise_for_status.return_value = None
+        primary.json.return_value = {"results": []}
+        for failure in (requests.exceptions.SSLError("certificate hostname mismatch"),
+                        requests.exceptions.Timeout("request timed out"),
+                        requests.exceptions.HTTPError("HTTP 503")):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch("weather.requests.get", side_effect=[primary, failure]):
+                with self.assertRaises(RuntimeError) as error:
+                    search_locations("560075", country_code="IN", geonames_username="private-test-user")
+                self.assertNotIn("private-test-user", str(error.exception))
+                self.assertIn("GeoNames fallback failed", str(error.exception))
+
+    def test_geonames_exact_match_replaces_nonexact_primary_postcode_match(self):
+        openmeteo, geonames = Mock(), Mock()
+        for response in (openmeteo, geonames):
+            response.raise_for_status.return_value = None
+        openmeteo.json.return_value = {"results": [self._place("Wrong", "United States", "US", 40, -70, postcodes=["00502"])]}
+        geonames.json.return_value = {"postalCodes": [{
+            "postalCode": "00501", "placeName": "Correct", "countryName": "United States",
+            "countryCode": "US", "lat": "41", "lng": "-71",
+        }]}
+        with patch("weather.requests.get", side_effect=[openmeteo, geonames]):
+            result = search_locations("00501", country_code="US", geonames_username="test-user")
+        self.assertEqual(result[0]["name"], "Correct")
+        self.assertEqual(result[0]["provider"], "GeoNames")
+
+    def test_geonames_failure_and_unconfigured_fallback_are_clear(self):
+        empty = Mock()
+        empty.raise_for_status.return_value = None
+        empty.json.return_value = {"results": []}
+        with patch("weather.requests.get", return_value=empty) as get:
+            with self.assertRaisesRegex(ValueError, "Streamlit Community Cloud.*Settings/Secrets"):
+                search_locations("99999")
+        self.assertEqual(get.call_count, 1)
+        failed_primary, failed_fallback = Mock(), Mock()
+        for response in (failed_primary, failed_fallback):
+            response.raise_for_status.return_value = None
+        failed_primary.json.return_value = {"results": []}
+        failed_fallback.json.return_value = {"status": {"message": "invalid username bad-user"}}
+        with patch("weather.requests.get", side_effect=[failed_primary, failed_fallback]):
+            with self.assertRaisesRegex(RuntimeError, "invalid username") as caught:
+                search_locations("99999", geonames_username="bad-user")
+            self.assertNotIn("bad-user", str(caught.exception))
+
+    def test_weather_state_clear_and_refresh_helpers(self):
+        state = {"weather_query": "London", "weather_country_filter": "GB",
+                 "weather_locations": [{"name": "London"}], "weather_selected": 0,
+                 "weather_bundle": {"place": "London"}, "weather_bundle_location": (51.5, -.1),
+                 "weather_error": "old error", "weather_refresh_key": 3}
+        clear_weather_state(state)
+        self.assertEqual(state["weather_query"], "")
+        self.assertEqual(state["weather_country_filter"], "")
+        self.assertEqual(state["weather_locations"], [])
+        self.assertIsNone(state["weather_bundle"])
+        self.assertIsNone(state["weather_bundle_location"])
+        self.assertIsNone(state["weather_error"])
+        self.assertEqual(next_weather_refresh(state), 4)
 
     def test_global_search_queries_remain_unfiltered(self):
         response = Mock()

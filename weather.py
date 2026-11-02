@@ -1,8 +1,11 @@
-"""Open-Meteo geocoding, observed conditions, and seven-day forecast."""
+"""Open-Meteo geocoding, model-based current weather, and forecasts."""
 from datetime import datetime, timezone
+import math
 import os
 import re
+import time
 import unicodedata
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pycountry
 import requests
@@ -10,16 +13,17 @@ import requests
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 GEONAMES_POSTAL_URL = "https://secure.geonames.org/postalCodeSearchJSON"
-SOURCE = "Open-Meteo Forecast API; current conditions are model-based estimates, not physical-station observations."
+SOURCE = "Open-Meteo Forecast API; best_match model output, not physical-station observations."
 WEATHER_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
-    45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Moderate drizzle",
-    55: "Dense drizzle", 56: "Freezing drizzle", 57: "Dense freezing drizzle",
-    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain", 66: "Freezing rain",
+    45: "Fog", 48: "Depositing rime fog", 51: "Light drizzle", 53: "Moderate drizzle",
+    55: "Dense drizzle", 56: "Light freezing drizzle", 57: "Dense freezing drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain", 66: "Light freezing rain",
     67: "Heavy freezing rain", 71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
-    77: "Snow grains", 80: "Slight rain showers", 81: "Rain showers", 82: "Heavy showers",
-    85: "Snow showers", 86: "Heavy snow showers", 95: "Thunderstorm",
-    96: "Thunderstorm with hail", 97: "Heavy thunderstorm", 99: "Severe thunderstorm",
+    77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers", 95: "Thunderstorm",
+    96: "Thunderstorm with slight hail", 97: "Heavy thunderstorm", 99: "Thunderstorm with heavy hail",
 }
 WEATHER_ICONS = {
     0: "☀️", 1: "🌤️", 2: "⛅", 3: "☁️", 45: "🌫️", 48: "🌫️",
@@ -336,25 +340,146 @@ def next_weather_refresh(state):
     return state["weather_refresh_key"]
 
 
-def get_weather_bundle(location, timeout=10):
-    """Retrieve current conditions and a seven-day forecast in local time."""
+CURRENT_VARIABLES = (
+    "temperature_2m,apparent_temperature,relative_humidity_2m,is_day,precipitation,rain,showers,"
+    "wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,cloud_cover,pressure_msl,visibility,"
+    "et0_fao_evapotranspiration,vapour_pressure_deficit,soil_temperature_0cm,soil_temperature_6cm,"
+    "soil_temperature_18cm,soil_temperature_54cm,soil_moisture_0_to_1cm,soil_moisture_1_to_3cm,"
+    "soil_moisture_3_to_9cm,soil_moisture_9_to_27cm,soil_moisture_27_to_81cm"
+)
+HOURLY_VARIABLES = (
+    "temperature_2m,apparent_temperature,precipitation_probability,precipitation,relative_humidity_2m,"
+    "wind_speed_10m,weather_code"
+)
+DAILY_VARIABLES = (
+    "weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,"
+    "precipitation_probability_max,precipitation_sum,wind_speed_10m_max,wind_gusts_10m_max,uv_index_max,"
+    "sunrise,sunset,sunshine_duration,et0_fao_evapotranspiration"
+)
+
+
+def _request_forecast_json(params, timeout, retries=1):
+    """Request forecast data, retrying only transient network/server failures."""
+    for attempt in range(retries + 1):
+        try:
+            response = requests.get(FORECAST_URL, params=params, timeout=timeout)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            transient = (isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                         and not isinstance(exc, requests.exceptions.SSLError))
+            transient = transient or status == 429 or (status is not None and status >= 500)
+            if transient and attempt < retries:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Open-Meteo forecast request failed ({type(exc).__name__}).") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Open-Meteo forecast returned invalid JSON.") from exc
+        return payload, datetime.now(timezone.utc)
+
+
+def _finite_number(value):
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        response = requests.get(FORECAST_URL, params={
-            "latitude": location["latitude"], "longitude": location["longitude"],
-            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,weather_code,cloud_cover,pressure_msl",
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,et0_fao_evapotranspiration",
-            "forecast_days": 7, "timezone": location.get("timezone") or "auto",
-            "wind_speed_unit": "kmh", "temperature_unit": "celsius", "precipitation_unit": "mm",
-        }, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Open-Meteo forecast request failed: {exc}") from exc
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _timestamp(value, zone):
+    """Parse Open-Meteo Unix timestamps; accept ISO values for older cached/test payloads."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return datetime.fromtimestamp(value, timezone.utc).astimezone(zone)
+    if not isinstance(value, str):
+        raise ValueError("Invalid weather timestamp.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
-        raise RuntimeError("Open-Meteo forecast returned invalid JSON.") from exc
+        raise ValueError("Invalid weather timestamp.") from exc
+    return parsed.replace(tzinfo=zone) if parsed.tzinfo is None else parsed.astimezone(zone)
+
+
+def _number_at(data, field, index):
+    values = data.get(field)
+    return _finite_number(values[index]) if isinstance(values, list) and index < len(values) else None
+
+
+def _weather_code(value):
+    number = _finite_number(value)
+    return int(number) if number is not None and number.is_integer() else None
+
+
+def _validate_units(payload):
+    """Reject explicit API unit mismatches; missing unit metadata remains optional."""
+    expected = {
+        "temperature_2m": {"°C"}, "apparent_temperature": {"°C"},
+        "relative_humidity_2m": {"%"}, "precipitation": {"mm"}, "rain": {"mm"},
+        "showers": {"mm"}, "wind_speed_10m": {"km/h"}, "wind_gusts_10m": {"km/h"},
+        "wind_direction_10m": {"°"}, "cloud_cover": {"%"}, "pressure_msl": {"hPa"},
+        "visibility": {"m"}, "vapour_pressure_deficit": {"kPa"},
+        "temperature_2m_max": {"°C"}, "temperature_2m_min": {"°C"},
+        "apparent_temperature_max": {"°C"}, "apparent_temperature_min": {"°C"},
+        "precipitation_probability_max": {"%"}, "precipitation_sum": {"mm"},
+        "wind_speed_10m_max": {"km/h"}, "wind_gusts_10m_max": {"km/h"},
+        "et0_fao_evapotranspiration": {"mm"}, "sunshine_duration": {"s"},
+    }
+    for units_key in ("current_units", "hourly_units", "daily_units"):
+        units = payload.get(units_key)
+        if not isinstance(units, dict):
+            continue
+        for variable, allowed in expected.items():
+            if variable in units and units[variable] not in allowed:
+                raise RuntimeError(f"Open-Meteo returned an unexpected unit for {variable}.")
+
+
+def _freshness(age_seconds):
+    """Heuristic based on the API's valid-time timestamp, not model-run age."""
+    if age_seconds is None or age_seconds < 0:
+        return "unknown"
+    if age_seconds <= 90 * 60:
+        return "fresh"
+    if age_seconds <= 6 * 60 * 60:
+        return "delayed"
+    return "stale"
+
+
+def get_weather_bundle(location, timeout=10):
+    """Retrieve best-match current, hourly, daily, and agricultural forecast data."""
+    latitude = _finite_number(location.get("latitude"))
+    longitude = _finite_number(location.get("longitude"))
+    if latitude is None or longitude is None or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+        raise ValueError("Weather coordinates must be valid WGS84 latitude and longitude values.")
+    requested_timezone = location.get("timezone") or "auto"
+    try:
+        zone = ZoneInfo(requested_timezone) if requested_timezone != "auto" else None
+    except (ZoneInfoNotFoundError, TypeError):
+        raise ValueError("The selected location has an invalid IANA time zone.")
+
+    params = {
+        "latitude": latitude, "longitude": longitude,
+        "current": CURRENT_VARIABLES,
+        "hourly": HOURLY_VARIABLES,
+        "daily": DAILY_VARIABLES,
+        # A buffer is needed because some stitched model feeds return already
+        # elapsed hourly timestamps before the API's current valid time.
+        # Include a buffer because the API can include the already-started
+        # local calendar day before the current valid date in its daily series.
+        "forecast_days": 8, "forecast_hours": 48,
+        "models": "best_match",
+        "timezone": requested_timezone,
+        "timeformat": "unixtime",
+        "wind_speed_unit": "kmh", "temperature_unit": "celsius", "precipitation_unit": "mm",
+    }
+    payload, retrieved_at = _request_forecast_json(params, timeout)
     if not isinstance(payload, dict):
         raise RuntimeError("Open-Meteo forecast returned an invalid response shape.")
+    _validate_units(payload)
     current = payload.get("current")
+    hourly = payload.get("hourly")
     daily = payload.get("daily")
     required_current = ("time", "temperature_2m", "apparent_temperature", "relative_humidity_2m", "precipitation",
                         "wind_speed_10m", "wind_direction_10m", "weather_code", "cloud_cover", "pressure_msl")
@@ -366,52 +491,148 @@ def get_weather_bundle(location, timeout=10):
         raise RuntimeError("Open-Meteo returned an incomplete daily forecast.")
     if any(not isinstance(daily[name], list) for name in required_daily):
         raise RuntimeError("Open-Meteo returned malformed daily forecast arrays.")
-    count = min(7, len(daily["time"]))
-    if count == 0:
+    day_count = min(8, len(daily["time"]))
+    if day_count == 0:
         raise RuntimeError("Open-Meteo returned no forecast days.")
-    if any(len(daily[name]) < count for name in required_daily[1:]):
+    if any(len(daily[name]) < day_count for name in required_daily[1:]):
         raise RuntimeError("Open-Meteo returned mismatched forecast arrays.")
+    response_timezone = payload.get("timezone") or requested_timezone
+    if response_timezone == "auto":
+        raise RuntimeError("Open-Meteo did not return the selected location's resolved timezone.")
+    try:
+        zone = ZoneInfo(response_timezone)
+        current_time = _timestamp(current["time"], zone)
+    except (ZoneInfoNotFoundError, TypeError, ValueError, OverflowError, OSError) as exc:
+        raise RuntimeError("Open-Meteo returned an invalid timezone or current timestamp.") from exc
+
+    now = datetime.now(timezone.utc)
+    valid_age = (now - current_time.astimezone(timezone.utc)).total_seconds()
+    valid_age = valid_age if valid_age >= 0 else None
+    current_values = {key: _finite_number(current.get(key)) for key in (
+        "temperature_2m", "apparent_temperature", "relative_humidity_2m", "precipitation", "rain", "showers",
+        "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m", "cloud_cover", "pressure_msl",
+        "visibility", "et0_fao_evapotranspiration", "vapour_pressure_deficit", "soil_temperature_0cm",
+        "soil_temperature_6cm", "soil_temperature_18cm", "soil_temperature_54cm", "soil_moisture_0_to_1cm",
+        "soil_moisture_1_to_3cm", "soil_moisture_3_to_9cm", "soil_moisture_9_to_27cm",
+        "soil_moisture_27_to_81cm",
+    )}
+    code = _weather_code(current.get("weather_code"))
+    current_row = {
+        "time": current_time.strftime("%Y-%m-%d %H:%M %Z"),
+        "time_utc": current_time.astimezone(timezone.utc).isoformat(timespec="minutes"),
+        "interval_seconds": _finite_number(current.get("interval")),
+        "temperature_c": current_values["temperature_2m"],
+        "apparent_temperature_c": current_values["apparent_temperature"],
+        "humidity_pct": current_values["relative_humidity_2m"],
+        "precipitation_mm": current_values["precipitation"], "rain_mm": current_values["rain"],
+        "showers_mm": current_values["showers"], "wind_kmh": current_values["wind_speed_10m"],
+        "wind_direction_deg": current_values["wind_direction_10m"],
+        "wind_gusts_kmh": current_values["wind_gusts_10m"], "cloud_cover_pct": current_values["cloud_cover"],
+        "pressure_hpa": current_values["pressure_msl"],
+        "visibility_km": current_values["visibility"] / 1000 if current_values["visibility"] is not None else None,
+        "is_day": _weather_code(current.get("is_day")), "weather_code": code,
+        "icon": WEATHER_ICONS.get(code, "🌡️") if code is not None else "🌡️",
+        "condition": WEATHER_CODES.get(code, f"Weather code {code}" if code is not None else "Unavailable"),
+        "agriculture": {
+            "et0_mm": current_values["et0_fao_evapotranspiration"],
+            "vpd_kpa": current_values["vapour_pressure_deficit"],
+            "soil_temperature_c": {"0 cm": current_values["soil_temperature_0cm"],
+                                   "6 cm": current_values["soil_temperature_6cm"],
+                                   "18 cm": current_values["soil_temperature_18cm"],
+                                   "54 cm": current_values["soil_temperature_54cm"]},
+            "soil_moisture_m3_m3": {"0–1 cm": current_values["soil_moisture_0_to_1cm"],
+                                   "1–3 cm": current_values["soil_moisture_1_to_3cm"],
+                                   "3–9 cm": current_values["soil_moisture_3_to_9cm"],
+                                   "9–27 cm": current_values["soil_moisture_9_to_27cm"],
+                                   "27–81 cm": current_values["soil_moisture_27_to_81cm"]},
+        },
+    }
+
+    hourly_rows = []
+    if isinstance(hourly, dict) and isinstance(hourly.get("time"), list):
+        for i, raw_time in enumerate(hourly["time"]):
+            try:
+                point_time = _timestamp(raw_time, zone)
+            except (TypeError, ValueError, OverflowError, OSError):
+                raise RuntimeError("Open-Meteo returned an invalid hourly timestamp.")
+            if point_time.astimezone(timezone.utc) < now:
+                continue
+            hourly_code = _weather_code(_number_at(hourly, "weather_code", i))
+            hourly_rows.append({
+                "time": point_time, "time_label": point_time.strftime("%a %H:%M"),
+                "temperature_c": _number_at(hourly, "temperature_2m", i),
+                "apparent_temperature_c": _number_at(hourly, "apparent_temperature", i),
+                "precipitation_probability_pct": _number_at(hourly, "precipitation_probability", i),
+                "precipitation_mm": _number_at(hourly, "precipitation", i),
+                "humidity_pct": _number_at(hourly, "relative_humidity_2m", i),
+                "wind_kmh": _number_at(hourly, "wind_speed_10m", i),
+                "weather_code": hourly_code,
+                "condition": WEATHER_CODES.get(hourly_code, "Unavailable") if hourly_code is not None else "Unavailable",
+            })
+            if len(hourly_rows) == 24:
+                break
     daily_rows = []
-    for i in range(count):
-        code = daily["weather_code"][i]
+    for i in range(day_count):
+        try:
+            day_time = _timestamp(daily["time"][i], zone)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise RuntimeError("Open-Meteo returned an invalid daily timestamp.") from exc
+        day_code = _weather_code(_number_at(daily, "weather_code", i))
+        if day_time.date() < current_time.date():
+            continue
         daily_rows.append({
-            "date": daily["time"][i],
-            "day": datetime.fromisoformat(daily["time"][i]).strftime("%A"),
-            "condition": WEATHER_CODES.get(code, f"Weather code {code}"),
-            "icon": WEATHER_ICONS.get(code, "🌡️"),
-            "weather_code": code,
-            "precipitation_probability_pct": daily["precipitation_probability_max"][i],
-            "temperature_min": daily["temperature_2m_min"][i],
-            "temperature_max": daily["temperature_2m_max"][i],
-            "precipitation_mm": daily["precipitation_sum"][i],
-            "wind_max_kmh": _optional(daily.get("wind_speed_10m_max"), i),
-            "et0_mm": _optional(daily.get("et0_fao_evapotranspiration"), i),
+            "date": day_time.date().isoformat(), "day": day_time.strftime("%A"),
+            "condition": WEATHER_CODES.get(day_code, f"Weather code {day_code}" if day_code is not None else "Unavailable"),
+            "icon": WEATHER_ICONS.get(day_code, "🌡️") if day_code is not None else "🌡️",
+            "weather_code": day_code,
+            "temperature_min": _number_at(daily, "temperature_2m_min", i),
+            "temperature_max": _number_at(daily, "temperature_2m_max", i),
+            "apparent_temperature_min": _number_at(daily, "apparent_temperature_min", i),
+            "apparent_temperature_max": _number_at(daily, "apparent_temperature_max", i),
+            "precipitation_probability_pct": _number_at(daily, "precipitation_probability_max", i),
+            "precipitation_mm": _number_at(daily, "precipitation_sum", i),
+            "wind_max_kmh": _number_at(daily, "wind_speed_10m_max", i),
+            "wind_gust_max_kmh": _number_at(daily, "wind_gusts_10m_max", i),
+            "uv_index_max": _number_at(daily, "uv_index_max", i),
+            "sunrise": _local_clock(_number_at(daily, "sunrise", i), zone),
+            "sunset": _local_clock(_number_at(daily, "sunset", i), zone),
+            "sunshine_hours": (_number_at(daily, "sunshine_duration", i) / 3600
+                               if _number_at(daily, "sunshine_duration", i) is not None else None),
+            "et0_mm": _number_at(daily, "et0_fao_evapotranspiration", i),
         })
+        if len(daily_rows) == 7:
+            break
+    if not daily_rows:
+        raise RuntimeError("Open-Meteo returned no daily forecast for the current local date or later.")
+
     return {
         "place": ", ".join(part for part in (location.get("name"), location.get("admin1"), location.get("country")) if part),
-        "latitude": location["latitude"], "longitude": location["longitude"],
-        "timezone": payload.get("timezone", location.get("timezone", "")),
-        "postal_code": location.get("postal_code", ""),
-        "country_code": location.get("country_code", ""),
+        "latitude": latitude, "longitude": longitude,
+        "timezone": response_timezone,
+        "postal_code": location.get("postal_code", ""), "country_code": location.get("country_code", ""),
         "geocoding_provider": location.get("provider", "Open-Meteo"),
         "weather_provider": "Open-Meteo Forecast API",
+        "model_selection": "best_match",
         "weather_model": payload.get("model") or payload.get("models"),
-        "current": {
-            "time": current["time"], "temperature_c": current["temperature_2m"],
-            "apparent_temperature_c": current["apparent_temperature"],
-            "humidity_pct": current["relative_humidity_2m"],
-            "precipitation_mm": current["precipitation"],
-            "wind_kmh": current["wind_speed_10m"],
-            "wind_direction_deg": current["wind_direction_10m"],
-            "cloud_cover_pct": current["cloud_cover"],
-            "pressure_hpa": current["pressure_msl"],
-            "icon": WEATHER_ICONS.get(current["weather_code"], "🌡️"),
-            "condition": WEATHER_CODES.get(current["weather_code"], f"Weather code {current['weather_code']}"),
-        },
-        "daily": daily_rows,
-        "fetched_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model_run_initialization_utc": None,
+        "model_run_availability_utc": None,
+        "model_run_metadata_note": "Open-Meteo does not identify the individual models/runs used by best_match in this response; run age is unavailable.",
+        "current": current_row, "hourly": hourly_rows, "daily": daily_rows,
+        "valid_time_age_seconds": valid_age,
+        "valid_time_freshness": _freshness(valid_age),
+        "retrieved_at_utc": retrieved_at.isoformat(timespec="seconds"),
+        "fetched_at_utc": retrieved_at.isoformat(timespec="seconds"),
         "source": SOURCE,
     }
+
+
+def _local_clock(timestamp, zone):
+    if timestamp is None:
+        return None
+    try:
+        return _timestamp(timestamp, zone).strftime("%H:%M %Z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def _optional(values, index):

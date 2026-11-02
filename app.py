@@ -55,12 +55,23 @@ div[data-testid="stAlert"] *,[data-testid="stNotification"] * { color:#26352D; }
 .eyebrow { color:#52645A; letter-spacing:.13em; font-size:.72rem; font-weight:700; text-transform:uppercase; }
 a,a:visited { color:#174D35; }
 </style>
-<div class="hero"><div class="eyebrow">Field intelligence · Soil and climate</div><h1>AgriSense AI</h1><p>Explore soil measurements, real weather observations and crop suitability evidence.</p></div>
+<div class="hero"><div class="eyebrow">Field intelligence · Soil and climate</div><h1>AgriSense AI</h1><p>Explore soil measurements, live weather estimates and crop suitability evidence.</p></div>
 """, unsafe_allow_html=True)
 
 
 def _format_metric(value, unit):
     return "Unavailable" if value is None or pd.isna(value) else f"{float(value):.1f} {unit}"
+
+
+def _age_label(seconds):
+    if seconds is None or seconds < 0:
+        return "unavailable"
+    seconds = int(seconds)
+    if seconds < 60:
+        return "less than a minute ago"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    return f"{seconds // 3600} h {(seconds % 3600) // 60} min ago"
 
 
 @st.cache_resource(show_spinner="Training and evaluating KNN and Random Forest on the labeled dataset…")
@@ -74,7 +85,10 @@ def cached_locations(query, country_code, geonames_username, refresh_key):
                             geonames_username=geonames_username)
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
+WEATHER_CACHE_TTL_SECONDS = 5 * 60
+
+
+@st.cache_data(ttl=WEATHER_CACHE_TTL_SECONDS, max_entries=128, show_spinner=False)
 def cached_weather(latitude, longitude, timezone_name, name, admin1, country, refresh_key):
     location = {"latitude": latitude, "longitude": longitude, "timezone": timezone_name,
                 "name": name, "admin1": admin1, "country": country}
@@ -469,11 +483,9 @@ with weather_tab:
                                                                       loc["country"], st.session_state.weather_refresh_key)
                     st.session_state.weather_bundle_location = selected_coordinates
                     st.session_state.weather_error = None
-                    st.success(f"Fresh weather received for {st.session_state.weather_bundle['place']}.")
+                    st.success(f"Updated weather response received for {st.session_state.weather_bundle['place']}.")
                 except (RuntimeError, ValueError) as exc:
                     st.session_state.weather_error = str(exc)
-                    st.session_state.weather_bundle = None
-                    st.error(str(exc))
         elif city.strip() and st.button("Search locations again", width="stretch", key="refresh_location_search"):
             st.session_state.location_refresh_key += 1
             try:
@@ -486,32 +498,61 @@ with weather_tab:
                 st.error(str(exc))
     with wc2:
         weather = st.session_state.weather_bundle
-        if st.session_state.weather_error:
-            st.warning("The latest weather request failed. No fallback values are shown. " + st.session_state.weather_error)
+        if st.session_state.weather_error and weather:
+            st.warning(
+                "Refresh failed. Showing the last successful weather response, not a fresh update. "
+                f"It was retrieved {_age_label((datetime.now(timezone.utc) - datetime.fromisoformat(weather['retrieved_at_utc'])).total_seconds())}. "
+                + st.session_state.weather_error
+            )
+        elif st.session_state.weather_error:
+            st.error(st.session_state.weather_error)
         if weather:
             cur = weather["current"]
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric(f"{cur['icon']} Temperature", _format_metric(cur["temperature_c"], "°C"), cur["condition"])
             m2.metric("Feels like", _format_metric(cur["apparent_temperature_c"], "°C"))
             m3.metric("Humidity", _format_metric(cur["humidity_pct"], "%"))
-            m4, m5, m6 = st.columns(3)
-            m4.metric("Wind", _format_metric(cur["wind_kmh"], "km/h"), f"Direction {cur['wind_direction_deg']}°")
-            m5.metric("Current-interval precipitation", _format_metric(cur["precipitation_mm"], "mm"), help="Current API interval; not a daily or seasonal total.")
-            m6.metric("Cloud cover", _format_metric(cur["cloud_cover_pct"], "%"))
-            m7, m8 = st.columns(2)
-            m7.metric("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"))
-            m8.metric("Today reference ET₀", _format_metric(weather["daily"][0]["et0_mm"], "mm"))
+            m4.metric("Wind", _format_metric(cur["wind_kmh"], "km/h"), f"Direction {_format_metric(cur['wind_direction_deg'], '°')}")
+            m5, m6, m7, m8 = st.columns(4)
+            m5.metric("Precipitation", _format_metric(cur["precipitation_mm"], "mm"), help=f"Accumulation over the preceding {cur['interval_seconds'] or 'API'} seconds.")
+            m6.metric("Rain / showers", f"{_format_metric(cur['rain_mm'], 'mm')} / {_format_metric(cur['showers_mm'], 'mm')}")
+            m7.metric("Wind gusts", _format_metric(cur["wind_gusts_kmh"], "km/h"))
+            m8.metric("Visibility", _format_metric(cur["visibility_km"], "km"))
+            m9, m10, m11 = st.columns(3)
+            m9.metric("Cloud cover", _format_metric(cur["cloud_cover_pct"], "%"))
+            m10.metric("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"))
+            m11.metric("Daylight", "Day" if cur["is_day"] == 1 else "Night" if cur["is_day"] == 0 else "Unavailable")
             st.write(f"**{weather['place']}** · {cur['icon']} {cur['condition']}")
-            st.caption(f"Current conditions valid at local time: {cur['time']} ({weather['timezone']}) · Retrieved {weather['fetched_at_utc']} UTC")
+            st.caption(f"Weather valid at {cur['time']} ({weather['timezone']}) · Valid-time age: {_age_label(weather['valid_time_age_seconds'])} ({weather['valid_time_freshness']})")
+            st.caption(f"Last API retrieval: {weather['retrieved_at_utc']} UTC · {_age_label((datetime.now(timezone.utc) - datetime.fromisoformat(weather['retrieved_at_utc'])).total_seconds())}")
+            st.caption(f"Model selection: {weather['model_selection']}. Model initialization/availability age: unavailable from this blended API response.")
             st.caption(weather["source"])
-            if weather.get("weather_model"):
-                st.caption(f"Weather model metadata: {weather['weather_model']}")
             st.caption(f"Geocoding provider: {weather.get('geocoding_provider', 'Open-Meteo')} · Weather provider: {weather.get('weather_provider', 'Open-Meteo Forecast API')}")
+            st.caption("Open-Meteo weather data · [Attribution and licence](https://open-meteo.com/en/terms)")
         else:
             st.info("Search and select a location to request live weather. Values appear only after a successful API response.")
 
     weather = st.session_state.weather_bundle
     if weather:
+        st.markdown("#### Next 24 hours")
+        if not weather["hourly"]:
+            st.info("Hourly forecast data is currently unavailable for this response.")
+        else:
+            hourly_frame = pd.DataFrame(weather["hourly"])
+            hfig = go.Figure()
+            hfig.add_trace(go.Scatter(x=hourly_frame["time"], y=hourly_frame["temperature_c"], name="Temperature · °C", mode="lines+markers", line={"color":"#174D35"}))
+            hfig.add_trace(go.Scatter(x=hourly_frame["time"], y=hourly_frame["apparent_temperature_c"], name="Feels like · °C", mode="lines+markers", line={"color":"#6E9B7C"}))
+            hfig.add_trace(go.Bar(x=hourly_frame["time"], y=hourly_frame["precipitation_probability_pct"], name="Rain probability · %", yaxis="y2", marker_color="rgba(65,125,165,.32)"))
+            hfig.update_layout(template="plotly_white", paper_bgcolor="#fff", plot_bgcolor="#fff", font_color="#26352D",
+                               yaxis_title="Temperature · °C", yaxis2={"title":"Rain chance · %","overlaying":"y","side":"right","range":[0,100]},
+                               barmode="overlay", height=360, margin={"t":20,"b":10}, legend={"orientation":"h","y":1.12})
+            st.plotly_chart(hfig, width="stretch")
+            display_hourly = hourly_frame[["time_label", "temperature_c", "apparent_temperature_c", "precipitation_probability_pct", "precipitation_mm", "humidity_pct", "wind_kmh", "condition"]].rename(columns={
+                "time_label":"Local time", "temperature_c":"Temperature · °C", "apparent_temperature_c":"Feels like · °C",
+                "precipitation_probability_pct":"Rain chance · %", "precipitation_mm":"Precipitation · mm",
+                "humidity_pct":"Humidity · %", "wind_kmh":"Wind · km/h", "condition":"Condition"})
+            st.dataframe(display_hourly, hide_index=True, width="stretch")
+
         st.markdown("#### Seven-day forecast")
         daily_frame = pd.DataFrame(weather["daily"])
         tfig = go.Figure()
@@ -522,14 +563,37 @@ with weather_tab:
         rain = px.bar(daily_frame, x="date", y="precipitation_mm", color="precipitation_mm", color_continuous_scale=["#DCEBDD", "#246447"], labels={"date":"Local date","precipitation_mm":"Forecast precipitation · mm"})
         rain.update_layout(template="plotly_white", paper_bgcolor="#fff", plot_bgcolor="#fff", font_color="#26352D", coloraxis_showscale=False, height=260)
         st.plotly_chart(rain, width="stretch")
-        display_daily = daily_frame[["day", "date", "icon", "condition", "temperature_min", "temperature_max", "precipitation_probability_pct", "precipitation_mm", "wind_max_kmh", "et0_mm"]].rename(columns={
-            "day":"Day", "date":"Local date", "icon":"", "condition":"Conditions", "temperature_min":"Min °C", "temperature_max":"Max °C",
-            "precipitation_probability_pct":"Rain chance · %", "precipitation_mm":"Forecast rain/precip · mm", "wind_max_kmh":"Max wind · km/h", "et0_mm":"ET₀ · mm",
-        })
-        st.dataframe(display_daily, hide_index=True, width="stretch")
+        card_rows = [daily_frame.iloc[i:i + 3] for i in range(0, len(daily_frame), 3)]
+        for row in card_rows:
+            day_cols = st.columns(3)
+            for col, (_, day) in zip(day_cols, row.iterrows()):
+                with col:
+                    with st.container(border=True):
+                        st.markdown(f"**{day['day']} · {day['date']}**")
+                        st.write(f"{day['icon']} {day['condition']} · {_format_metric(day['temperature_max'], '°C')} / {_format_metric(day['temperature_min'], '°C')}")
+                        st.caption(f"Feels like max/min: {_format_metric(day['apparent_temperature_max'], '°C')} / {_format_metric(day['apparent_temperature_min'], '°C')}")
+                        st.caption(f"Rain chance: {_format_metric(day['precipitation_probability_pct'], '%')} · Precipitation: {_format_metric(day['precipitation_mm'], 'mm')}")
+                        st.caption(f"Wind/gusts: {_format_metric(day['wind_max_kmh'], 'km/h')} / {_format_metric(day['wind_gust_max_kmh'], 'km/h')} · UV max: {_format_metric(day['uv_index_max'], '')}")
+                        st.caption(f"Sunrise/sunset: {day['sunrise'] or 'Unavailable'} / {day['sunset'] or 'Unavailable'} · Sun: {_format_metric(day['sunshine_hours'], 'h')}")
         rain_values = daily_frame["precipitation_mm"].dropna()
         total_rain = f"{rain_values.sum():.1f} mm" if not rain_values.empty else "unavailable"
-        st.caption(f"Seven-day forecast precipitation total: {total_rain}. ET₀ is shown only when returned by Open-Meteo; it is reference evapotranspiration, not a direct irrigation prescription.")
+        st.caption(f"Seven-day forecast precipitation total: {total_rain}.")
+
+        st.markdown("#### Agricultural weather indicators")
+        ag = cur["agriculture"]
+        et0_today = daily_frame.iloc[0]["et0_mm"]
+        ag1, ag2, ag3 = st.columns(3)
+        ag1.metric("Today reference ET₀", _format_metric(et0_today, "mm"))
+        ag2.metric("Vapour-pressure deficit", _format_metric(ag["vpd_kpa"], "kPa"))
+        ag2.caption("Higher VPD indicates greater atmospheric drying demand.")
+        ag3.metric("Surface soil temperature", _format_metric(ag["soil_temperature_c"]["0 cm"], "°C"))
+        ag3.caption("ET₀ describes reference-grass water demand; it is not an irrigation prescription.")
+        soil_rows = [{"Modeled depth": depth, "Variable": "Soil temperature", "Value": value, "Unit": "°C"}
+                     for depth, value in ag["soil_temperature_c"].items()]
+        soil_rows += [{"Modeled depth": depth, "Variable": "Soil moisture", "Value": value, "Unit": "m³/m³"}
+                      for depth, value in ag["soil_moisture_m3_m3"].items()]
+        st.dataframe(pd.DataFrame(soil_rows), hide_index=True, width="stretch")
+        st.caption("Higher ET₀ indicates greater reference-grass atmospheric water demand. Soil moisture indicates modelled water content by soil layer. Neither is a field-sensor reading or a guaranteed irrigation prescription; use these as contextual guidance, not professional agronomic advice.")
 
 with model_tab:
     st.subheader("Model comparison and evaluation")

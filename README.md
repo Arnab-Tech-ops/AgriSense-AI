@@ -2,7 +2,7 @@
 
 **Machine Learning-Based Soil Quality Classification and Crop Suitability Prediction System**
 
-AgriSense AI is a Streamlit decision-support application that combines user-supplied soil measurements, two validated crop classification models, optional SoilGrids map estimates, and live Open-Meteo weather. It distinguishes measured inputs, model predictions, rule-based screening, current observations, and forecasts.
+AgriSense AI is a Streamlit decision-support application that combines user-supplied soil measurements, two validated crop classification models, optional SoilGrids map estimates, and current model-based Open-Meteo weather estimates with forecasts. It distinguishes measured inputs, model predictions, rule-based screening, gridded model estimates, and forecasts.
 
 ## Features
 
@@ -56,7 +56,8 @@ python -m unittest discover -s tests -v
 
 - `app.py` — Streamlit sections, state, weather caching, visualizations, and recommendation flows.
 - `ml_model.py` — dataset validation, KNN/RF training and holdout metrics, prediction scores, explanations, and soil screening.
-- `weather.py` — Open-Meteo geocoding and current/7-day forecast client.
+- `weather.py` — Open-Meteo geocoding, GeoNames postal fallback, best-match current/hourly/daily weather parsing, freshness labels, and validation.
+- `scripts/evaluate_forecasts.py` — separate archived forecast lead-time evaluation against ERA5 reanalysis.
 - `soil_data.py` — manual/laboratory input validation, CSV parsing, and source register.
 - `soil_geo.py` — optional SoilGrids WCS point sampling. It is separate from crop-model inputs.
 - `data/Crop_recommendation.csv` — included public labeled crop dataset.
@@ -86,7 +87,23 @@ ISRIC states that the SoilGrids REST API is temporarily paused and documents WCS
 
 ## Weather API
 
-The app resolves place names and postal codes through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api), with ISO country-code filtering and a searchable country/territory selector. Country/state qualifiers and common aliases are supported. Exact postcode matches rank first; leading zeros and alphanumeric codes remain text, and duplicates are removed by coordinates. If Open-Meteo has no usable match and a GeoNames username is configured, its [postal-code service](https://www.geonames.org/export/web-services.html) is queried as a secondary source. Each result identifies the resolving provider and match type. The selected coordinates are passed to the [Open-Meteo Forecast API](https://open-meteo.com/en/docs), which returns temperature, apparent (feels-like) temperature, condition/icon, humidity, wind speed/direction, current-interval precipitation, cloud cover, pressure, and a local current time. Current conditions are model-based estimates, not physical weather-station observations; model metadata is shown only when returned. The seven-day forecast includes local day/date, condition, min/max temperature, maximum precipitation probability, rainfall, and maximum wind. Requests use the selected location timezone, finite timeouts, and manual refresh; each explicit weather refresh bypasses the prior cached response. ET₀ appears only if Open-Meteo provides it. Postal-code coverage remains provider- and country-dependent.
+The app resolves place names and postal codes through the [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api), with ISO country-code filtering and a searchable country/territory selector. Country/state qualifiers and common aliases are supported. Exact postcode matches rank first; leading zeros and alphanumeric codes remain text, and duplicates are removed by coordinates. If Open-Meteo has no usable match or exact postal-code match and a GeoNames username is configured, its [postal-code service](https://www.geonames.org/export/web-services.html) is queried as a secondary source. Each location result identifies its provider and match type.
+
+Weather uses `https://api.open-meteo.com/v1/forecast` with `models=best_match`. The API automatically combines the most suitable global and regional model output; AgriSense does not average models or claim a single selected model. Requested current variables include temperature, apparent temperature, humidity, day/night, precipitation, rain, showers, weather code, cloud cover, sea-level pressure, wind speed/direction/gusts, visibility, ET₀, vapour-pressure deficit, and available modeled soil temperature/moisture layers. The app also requests 24 upcoming hourly points and a seven-day forecast (temperature and apparent-temperature highs/lows, precipitation probability/amount, wind/gust maxima, UV index, sunrise/sunset, sunshine duration, and ET₀). Unsupported or missing values appear as unavailable.
+
+Current conditions are model-based estimates, not physical weather-station observations. The app converts Open-Meteo Unix timestamps through the selected IANA timezone so hourly times respect daylight-saving transitions. It separately labels the weather-valid time, its age, and the time the app last retrieved the API response. Fresh/delayed/stale is a **valid-timestamp-age heuristic** (fresh ≤90 minutes, delayed ≤6 hours, stale >6 hours), not proof of upstream model freshness. The automatic `best_match` response does not identify which individual model run supplied each value, and Open-Meteo's per-model update metadata cannot reliably identify the run behind its stitched response. Therefore model initialization and availability age are explicitly shown as unavailable rather than inferred. Open-Meteo notes that model updates occur at different cadences and that its redundant servers can take additional time to become consistent; see [Model Updates and Data Availability](https://open-meteo.com/en/docs/model-updates).
+
+Forecast responses are cached for five minutes to reduce repeated requests; the user-triggered refresh bypasses the cache. If refresh fails, the last successful response remains visible with its retrieval age and a warning, never relabeled as a fresh update. The finite-timeout client performs one limited retry for transient failures only. Open-Meteo data are licensed under [CC BY 4.0](https://open-meteo.com/en/pricing); the Live Weather view links to Open-Meteo attribution. The free API is for non-commercial use and has published request limits; see [terms](https://open-meteo.com/en/terms). Do not claim global postal coverage or station-level accuracy.
+
+### Forecast accuracy evaluation baseline
+
+Run the separate utility against a date range covered by archived forecast runs (most Previous Runs data begins in 2024; coverage varies by model):
+
+```powershell
+python scripts/evaluate_forecasts.py --latitude 18.51957 --longitude 73.85535 --timezone Asia/Kolkata --start-date 2026-09-01 --end-date 2026-09-30
+```
+
+The script requests archived `best_match` forecasts from Open-Meteo's [Previous Runs API](https://open-meteo.com/en/docs/previous-runs-api) at 1–7 day lead offsets. It aligns hourly temperature and precipitation valid times with Open-Meteo [ERA5 reanalysis](https://open-meteo.com/en/docs/historical-weather-api), then reports MAE/RMSE for hourly temperature, hourly precipitation, and complete local-day precipitation totals. Partial local days and unavailable variable values are excluded. ERA5 is a gridded reanalysis reference, not a station observation or independent ground truth; model and reanalysis grid resolutions differ. Values are a measured baseline only for the selected location/date range and do not demonstrate improved accuracy. For rainfall, ERA5 is used because the [ERA5-Land variable table](https://open-meteo.com/en/docs/historical-weather-api) does not list precipitation for that dataset.
 
 ## Known limitations and future improvements
 

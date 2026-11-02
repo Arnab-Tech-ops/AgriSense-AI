@@ -1,6 +1,8 @@
 import io
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import requests
 from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
@@ -11,8 +13,9 @@ import ml_model
 from ml_model import classify_soil_quality, load_dataset, predict_top_crops, train_models
 from soil_data import read_lab_report, validate_inputs
 from soil_data import soil_data_sources
-from weather import (clear_weather_state, country_options, get_weather_bundle,
-                     next_weather_refresh, search_locations)
+from weather import (_freshness, _timestamp, clear_weather_state, country_options,
+                     get_weather_bundle, next_weather_refresh, search_locations,
+                     _validate_units)
 from soil_geo import fetch_soilgrids_estimate
 
 
@@ -456,6 +459,8 @@ class WeatherTests(unittest.TestCase):
         self.assertEqual(result["current"]["wind_direction_deg"], 180)
         self.assertEqual(result["current"]["cloud_cover_pct"], 45)
         self.assertEqual(result["current"]["pressure_hpa"], 1012.4)
+        self.assertIsNone(result["current"]["wind_gusts_kmh"])
+        self.assertIsNone(result["current"]["visibility_km"])
         self.assertEqual(result["current"]["icon"], "⛅")
         self.assertEqual(result["daily"][0]["day"], "Sunday")
         self.assertEqual(result["daily"][0]["precipitation_probability_pct"], 60)
@@ -469,6 +474,12 @@ class WeatherTests(unittest.TestCase):
         self.assertIn("wind_direction_10m", params["current"])
         self.assertIn("precipitation_probability_max", params["daily"])
 
+    def test_invalid_coordinates_and_explicit_unit_mismatch_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "valid WGS84"):
+            get_weather_bundle({"latitude":91,"longitude":0,"timezone":"UTC"})
+        with self.assertRaisesRegex(RuntimeError, "unexpected unit"):
+            _validate_units({"current_units":{"temperature_2m":"°F"}})
+
     def test_weather_parser_rejects_missing_current_or_daily_fields(self):
         response = Mock()
         response.raise_for_status.return_value = None
@@ -479,6 +490,77 @@ class WeatherTests(unittest.TestCase):
         with patch("weather.requests.get", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "incomplete current conditions"):
                 get_weather_bundle({"latitude": 12.9, "longitude": 77.5, "timezone": "Asia/Kolkata"})
+
+    def test_expanded_weather_fields_local_hours_and_agricultural_values(self):
+        now = datetime.now(timezone.utc)
+        zone = ZoneInfo("Asia/Kolkata")
+        today = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        current = {"time":int((now-timedelta(minutes=10)).timestamp()), "interval":900,
+                   "temperature_2m":25, "apparent_temperature":27, "relative_humidity_2m":60,
+                   "is_day":1, "precipitation":0.2, "rain":0.1, "showers":0.1,
+                   "wind_speed_10m":8, "wind_direction_10m":180, "wind_gusts_10m":11,
+                   "weather_code":2, "cloud_cover":45, "pressure_msl":1012.4, "visibility":9200,
+                   "et0_fao_evapotranspiration":0.2, "vapour_pressure_deficit":1.1,
+                   "soil_temperature_0cm":22, "soil_temperature_6cm":20,
+                   "soil_moisture_0_to_1cm":0.2}
+        hourly = {"time":[int((now+timedelta(minutes=5+i*60)).timestamp()) for i in range(24)],
+                  "temperature_2m":[25]*24, "apparent_temperature":[27]*24,
+                  "precipitation_probability":[10]*24, "precipitation":[0.1]*24,
+                  "relative_humidity_2m":[60]*24, "wind_speed_10m":[8]*24, "weather_code":[2]*24}
+        daily = {"time":[int(today.timestamp())], "weather_code":[2],
+                 "temperature_2m_min":[18], "temperature_2m_max":[29],
+                 "apparent_temperature_min":[17], "apparent_temperature_max":[31],
+                 "precipitation_probability_max":[60], "precipitation_sum":[1.2],
+                 "wind_speed_10m_max":[12], "wind_gusts_10m_max":[18], "uv_index_max":[8],
+                 "sunrise":[int((today+timedelta(hours=6)).timestamp())],
+                 "sunset":[int((today+timedelta(hours=18)).timestamp())], "sunshine_duration":[21600],
+                 "et0_fao_evapotranspiration":[4.1]}
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"current":current, "hourly":hourly, "daily":daily, "timezone":"Asia/Kolkata"}
+        with patch("weather.requests.get", return_value=response) as get:
+            result = get_weather_bundle({"latitude":18.5,"longitude":73.8,"timezone":"Asia/Kolkata"})
+        self.assertEqual(result["current"]["visibility_km"], 9.2)
+        self.assertEqual(result["current"]["rain_mm"], 0.1)
+        self.assertEqual(result["current"]["wind_gusts_kmh"], 11)
+        self.assertEqual(result["current"]["agriculture"]["vpd_kpa"], 1.1)
+        self.assertEqual(result["current"]["agriculture"]["soil_moisture_m3_m3"]["0–1 cm"], 0.2)
+        self.assertEqual(len(result["hourly"]), 24)
+        self.assertEqual(result["hourly"][0]["precipitation_probability_pct"], 10)
+        self.assertEqual(result["daily"][0]["sunrise"], "06:00 IST")
+        self.assertEqual(result["daily"][0]["sunshine_hours"], 6)
+        self.assertEqual(result["model_selection"], "best_match")
+        self.assertIsNone(result["model_run_initialization_utc"])
+        self.assertEqual(result["timezone"], "Asia/Kolkata")
+        self.assertEqual(get.call_args.kwargs["params"]["forecast_hours"], 48)
+
+    def test_weather_api_retries_one_transient_failure(self):
+        now = datetime.now(timezone.utc)
+        day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        current = {"time":int(now.timestamp()), "temperature_2m":1, "apparent_temperature":1,
+                   "relative_humidity_2m":50, "precipitation":0, "wind_speed_10m":1,
+                   "wind_direction_10m":0, "weather_code":0, "cloud_cover":0, "pressure_msl":1000}
+        hourly = {"time":[int((now+timedelta(hours=i+1)).timestamp()) for i in range(24)]}
+        daily = {"time":[int(day.timestamp())], "temperature_2m_min":[0], "temperature_2m_max":[2],
+                 "precipitation_probability_max":[0], "precipitation_sum":[0], "wind_speed_10m_max":[1], "weather_code":[0]}
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"current":current, "hourly":hourly, "daily":daily, "timezone":"UTC"}
+        with patch("weather.requests.get", side_effect=[requests.Timeout("transient"), response]) as get:
+            result = get_weather_bundle({"latitude":0,"longitude":0,"timezone":"UTC"})
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(result["model_selection"], "best_match")
+
+    def test_weather_valid_time_freshness_and_dst_conversion(self):
+        self.assertEqual(_freshness(30 * 60), "fresh")
+        self.assertEqual(_freshness(2 * 60 * 60), "delayed")
+        self.assertEqual(_freshness(7 * 60 * 60), "stale")
+        self.assertEqual(_freshness(None), "unknown")
+        zone = ZoneInfo("America/Toronto")
+        before_dst = _timestamp(int(datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc).timestamp()), zone)
+        after_dst = _timestamp(int(datetime(2026, 11, 1, 7, 30, tzinfo=timezone.utc).timestamp()), zone)
+        self.assertEqual(before_dst.strftime("%H:%M %z"), "01:30 -0400")
+        self.assertEqual(after_dst.strftime("%H:%M %z"), "02:30 -0500")
 
     def test_weather_parser_rejects_missing_daily_forecast_fields(self):
         response = Mock()

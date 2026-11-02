@@ -47,6 +47,27 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 div[data-testid="stMetric"] { padding:1rem; }
 div[data-testid="stMetric"] [data-testid="stMetricLabel"],div[data-testid="stMetric"] label { color:#52645A; }
 div[data-testid="stMetric"] [data-testid="stMetricValue"] { color:#26352D; }
+.st-key-weather_metrics [data-testid="stMetric"] {
+  box-sizing:border-box; width:100%; height:100%; min-width:0; padding:1rem 1.25rem;
+}
+.st-key-weather_metrics [data-testid="stMetricLabel"],
+.st-key-weather_metrics [data-testid="stMetricLabel"] *,
+.st-key-weather_metrics [data-testid="stMetric"] label {
+  color:#52645A; font-size:1rem; line-height:1.3;
+  white-space:normal !important; overflow:visible !important; text-overflow:clip !important;
+  overflow-wrap:anywhere;
+}
+.st-key-weather_metrics [data-testid="stMetricValue"],
+.st-key-weather_metrics [data-testid="stMetricValue"] * {
+  color:#26352D; font-size:clamp(1.45rem, 2vw, 1.9rem) !important; line-height:1.2;
+  white-space:normal !important; overflow:visible !important; text-overflow:clip !important;
+  overflow-wrap:anywhere; word-break:normal;
+}
+@media (max-width:640px) {
+  .st-key-weather_metrics [data-testid="stMetric"] { padding:.85rem 1rem; }
+  .st-key-weather_metrics [data-testid="stMetricValue"],
+  .st-key-weather_metrics [data-testid="stMetricValue"] * { font-size:1.5rem !important; }
+}
 div[data-testid="stAlert"] { color:#26352D; border:1px solid #DCE5DD; }
 div[data-testid="stAlert"] *,[data-testid="stNotification"] * { color:#26352D; }
 .hero { background:#fff; border:1px solid #DCE5DD; border-radius:18px; padding:1.5rem 1.8rem; margin-bottom:1rem; }
@@ -508,20 +529,27 @@ with weather_tab:
             st.error(st.session_state.weather_error)
         if weather:
             cur = weather["current"]
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(f"{cur['icon']} Temperature", _format_metric(cur["temperature_c"], "°C"), cur["condition"])
-            m2.metric("Feels like", _format_metric(cur["apparent_temperature_c"], "°C"))
-            m3.metric("Humidity", _format_metric(cur["humidity_pct"], "%"))
-            m4.metric("Wind", _format_metric(cur["wind_kmh"], "km/h"), f"Direction {_format_metric(cur['wind_direction_deg'], '°')}")
-            m5, m6, m7, m8 = st.columns(4)
-            m5.metric("Precipitation", _format_metric(cur["precipitation_mm"], "mm"), help=f"Accumulation over the preceding {cur['interval_seconds'] or 'API'} seconds.")
-            m6.metric("Rain / showers", f"{_format_metric(cur['rain_mm'], 'mm')} / {_format_metric(cur['showers_mm'], 'mm')}")
-            m7.metric("Wind gusts", _format_metric(cur["wind_gusts_kmh"], "km/h"))
-            m8.metric("Visibility", _format_metric(cur["visibility_km"], "km"))
-            m9, m10, m11 = st.columns(3)
-            m9.metric("Cloud cover", _format_metric(cur["cloud_cover_pct"], "%"))
-            m10.metric("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"))
-            m11.metric("Daylight", "Day" if cur["is_day"] == 1 else "Night" if cur["is_day"] == 0 else "Unavailable")
+            weather_metrics = [
+                (f"{cur['icon']} Temperature", _format_metric(cur["temperature_c"], "°C"), cur["condition"]),
+                ("Feels-like temperature", _format_metric(cur["apparent_temperature_c"], "°C"), None),
+                ("Relative humidity", _format_metric(cur["humidity_pct"], "%"), None),
+                ("Wind speed", _format_metric(cur["wind_kmh"], "km/h"), None),
+                ("Wind direction", _format_metric(cur["wind_direction_deg"], "°"), None),
+                ("Precipitation", _format_metric(cur["precipitation_mm"], "mm"),
+                 f"Accumulation over the preceding {cur['interval_seconds'] or 'API'} seconds."),
+                ("Rain / showers", f"{_format_metric(cur['rain_mm'], 'mm')} rain / "
+                 f"{_format_metric(cur['showers_mm'], 'mm')} showers", None),
+                ("Wind gusts", _format_metric(cur["wind_gusts_kmh"], "km/h"), None),
+                ("Visibility", _format_metric(cur["visibility_km"], "km"), None),
+                ("Cloud cover", _format_metric(cur["cloud_cover_pct"], "%"), None),
+                ("Sea-level pressure", _format_metric(cur["pressure_hpa"], "hPa"), None),
+                ("Daylight", "Day" if cur["is_day"] == 1 else "Night" if cur["is_day"] == 0 else "Unavailable", None),
+            ]
+            with st.container(key="weather_metrics"):
+                for first in range(0, len(weather_metrics), 2):
+                    columns = st.columns(2, gap="medium", wrap=True)
+                    for column, (label, value, help_text) in zip(columns, weather_metrics[first:first + 2]):
+                        column.metric(label, value, help=help_text, border=True, height="stretch")
             st.write(f"**{weather['place']}** · {cur['icon']} {cur['condition']}")
             st.caption(f"Weather valid at {cur['time']} ({weather['timezone']}) · Valid-time age: {_age_label(weather['valid_time_age_seconds'])} ({weather['valid_time_freshness']})")
             st.caption(f"Last API retrieval: {weather['retrieved_at_utc']} UTC · {_age_label((datetime.now(timezone.utc) - datetime.fromisoformat(weather['retrieved_at_utc'])).total_seconds())}")
